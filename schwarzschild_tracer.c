@@ -93,7 +93,7 @@ static int find_event_time_gsl(
     int iter = 0, max_iter = 100;
     const gsl_root_fsolver_type *T_solver = gsl_root_fsolver_brent;
     gsl_root_fsolver *s_solver = gsl_root_fsolver_alloc(T_solver);
-    if (!s_solver) { fprintf(stderr, "find_event_time_gsl: Failed to allocate GSL root solver.\n"); return 0; }
+    //if (!s_solver) { fprintf(stderr, "find_event_time_gsl: Failed to allocate GSL root solver.\n"); return 0; }
 
     gsl_function F_gsl_root;
     GslRootEventParams root_params_instance;
@@ -158,63 +158,112 @@ static int find_event_time_gsl(
     return 1;
 }
 
-static int reallocate_gsl_vector_if_needed(gsl_vector **vec_ptr, size_t current_count, size_t *current_capacity_ptr, size_t initial_capacity_val) {
-    if (!vec_ptr || !current_capacity_ptr) { return -1; }
+// PASTE THIS ENTIRE BLOCK TO REPLACE THE OLD reallocate_gsl_vector_if_needed FUNCTION
+static int reallocate_gsl_vector_if_needed(
+    gsl_vector **vec_ptr,                   // Pointer to your GSL vector (e.g., ¤t_segment_K_temp)
+    size_t current_logical_element_count,   // How many data points you've actually stored so far (this is your current_segment_point_count)
+    size_t *current_physical_capacity_ptr,  // Pointer to your capacity variable (e.g., ¤t_segment_K_capacity)
+    size_t initial_capacity_val) {          // Initial capacity if the vector was empty before
 
-    if (current_count >= *current_capacity_ptr) {
-        size_t new_capacity = (*current_capacity_ptr > 0) ? (*current_capacity_ptr * 2) : initial_capacity_val;
-        if (new_capacity <= current_count) { 
-            new_capacity = current_count + initial_capacity_val; 
-            if (new_capacity <= current_count) { 
-                new_capacity = current_count + 1;
-            }
-        }
-
-        gsl_vector *new_v = gsl_vector_alloc(new_capacity);
-        if (!new_v) {
-            fprintf(stderr, "reallocate_gsl_vector_if_needed: Failed to allocate new vector of size %zu\n", new_capacity);
-            return -1; 
-        }
-
-        gsl_vector *old_v = *vec_ptr;
-        if (old_v && old_v->size > 0) { 
-            size_t copy_size = old_v->size; 
-            if (copy_size > 0) {
-                 gsl_vector_const_view old_sub = gsl_vector_const_subvector(old_v, 0, copy_size);
-                 gsl_vector_view new_sub = gsl_vector_subvector(new_v, 0, copy_size);
-                 gsl_vector_memcpy(&new_sub.vector, &old_sub.vector);
-            }
-            new_v->size = old_v->size; 
-        } else {
-            new_v->size = 0; 
-        }
-
-        gsl_vector_free(old_v);
-        *vec_ptr = new_v;
-        *current_capacity_ptr = new_capacity;
+    if (!vec_ptr || !current_physical_capacity_ptr) {
+        //fprintf(stderr, "Error: Null pointer passed to reallocate_gsl_vector_if_needed.\n");
+        return -1; // Indicate an error
     }
-    return 0;
+
+    // We want to write to the index 'current_logical_element_count'.
+    // This means the vector needs to have space for at least 'current_logical_element_count + 1' elements.
+    // The GSL vector's 'size' field tells GSL how many elements it can safely access.
+    if (current_logical_element_count >= *current_physical_capacity_ptr) {
+        // Time to make the vector bigger!
+
+        size_t new_physical_capacity;
+        if (*current_physical_capacity_ptr > 0) {
+            new_physical_capacity = *current_physical_capacity_ptr * 2; // Double the current capacity
+        } else {
+            new_physical_capacity = initial_capacity_val; // If it was 0, use the initial capacity you defined
+        }
+
+        // Make sure the new capacity is definitely large enough for the next element we want to add,
+        // and preferably gives us some more room too.
+        if (new_physical_capacity <= current_logical_element_count) {
+            new_physical_capacity = current_logical_element_count + initial_capacity_val;
+            if (new_physical_capacity <= current_logical_element_count) { // Still not enough (e.g. initial_capacity_val is 0 or very small)
+                new_physical_capacity = current_logical_element_count + 1; // Absolute minimum to store the next element
+            }
+        }
+
+        // Ask GSL to allocate a new, bigger vector.
+        // IMPORTANT: After this line, new_v->size IS new_physical_capacity. GSL sets this correctly.
+        gsl_vector *new_v = gsl_vector_alloc(new_physical_capacity);
+        if (!new_v) {
+            //fprintf(stderr, "reallocate_gsl_vector_if_needed: GSL vector allocation failed for new capacity %zu\n", new_physical_capacity);
+            return -1; // Allocation failed, so we stop and report an error.
+        }
+
+        gsl_vector *old_v = *vec_ptr; // Get the pointer to the old, smaller vector
+
+        if (old_v) { // If there was an old vector (i.e., this is not the first allocation)
+            // Copy data from the old vector to the new, bigger vector.
+            // We only copy 'current_logical_element_count' items, because that's how many actual data points were in old_v.
+            size_t num_elements_to_copy = current_logical_element_count;
+
+            // This is a safety check. It should not normally happen if current_logical_element_count
+            // was correctly tracking the items in the old vector.
+            if (num_elements_to_copy > old_v->size) {
+                //fprintf(stderr, "Warning: reallocate_gsl_vector_if_needed: trying to copy more elements (%zu) than old vector's GSL size (%zu). This is unexpected. Truncating copy.\n",num_elements_to_copy, old_v->size);
+                num_elements_to_copy = old_v->size; // Limit copy to what GSL thought the old vector could hold.
+            }
+
+            if (num_elements_to_copy > 0) {
+                 // Create "views" into the vectors to specify which part to copy
+                 gsl_vector_const_view old_subvector_to_copy = gsl_vector_const_subvector(old_v, 0, num_elements_to_copy);
+                 gsl_vector_view new_subvector_to_paste_into = gsl_vector_subvector(new_v, 0, num_elements_to_copy);
+                 // Copy the data
+                 gsl_vector_memcpy(&new_subvector_to_paste_into.vector, &old_subvector_to_copy.vector);
+            }
+            gsl_vector_free(old_v); // Free the memory of the old, smaller vector. We don't need it anymore.
+        }
+
+        // *** THE MOST IMPORTANT PART: DO NOT CHANGE new_v->size here! ***
+        // `gsl_vector_alloc` already set `new_v->size` to `new_physical_capacity`.
+        // Your old code was incorrectly resetting `new_v->size` to the *old* capacity,
+        // which caused GSL to think the vector was smaller than it really was.
+
+        *vec_ptr = new_v; // Make your original pointer (e.g., current_segment_K_temp) point to the new, bigger vector.
+        *current_physical_capacity_ptr = new_physical_capacity; // Update your own variable that tracks the capacity.
+    }
+    return 0; // Success! The vector is now big enough (or was already big enough).
 }
 
 
-static int gsl_vector_dynamic_append(gsl_vector **vec_ptr, double value, size_t *current_capacity_ptr) {
+static int gsl_vector_dynamic_append(gsl_vector **vec_ptr, double value_param, size_t *current_capacity_ptr) {
     if (!vec_ptr || !current_capacity_ptr) { return -1; }
-    gsl_vector *vec = *vec_ptr;
 
-    if (!vec) { 
+    if (!(*vec_ptr)) { 
         *current_capacity_ptr = INITIAL_CROSSING_POINTS_CAPACITY; 
-        vec = gsl_vector_alloc(*current_capacity_ptr);
-        if (!vec) { fprintf(stderr, "gsl_vector_dynamic_append: Initial allocation failed.\n"); return -1; }
-        vec->size = 0; 
+        *vec_ptr = gsl_vector_alloc(*current_capacity_ptr); 
+        if (!(*vec_ptr)) { 
+            fprintf(stderr, "gsl_vector_dynamic_append: Initial allocation failed.\n"); // KEEP THIS
+            return -1; 
+        }
+        (*vec_ptr)->size = 0; 
     }
     
-    if (reallocate_gsl_vector_if_needed(&vec, vec->size, current_capacity_ptr, INITIAL_CROSSING_POINTS_CAPACITY) != 0) {
+    if (reallocate_gsl_vector_if_needed(vec_ptr, (*vec_ptr)->size, current_capacity_ptr, INITIAL_CROSSING_POINTS_CAPACITY) != 0) {
         return -1; 
     }
     
-    gsl_vector_set(vec, vec->size, value);
-    vec->size++;
-    *vec_ptr = vec;
+    size_t index_to_set = (*vec_ptr)->size;
+
+    if ((*vec_ptr)->data && index_to_set < *current_capacity_ptr) {
+        (*vec_ptr)->data[index_to_set] = value_param; 
+    } else {
+        fprintf(stderr, "DYNAMIC_APPEND_ERROR: Invalid state for direct write. Index: %zu, Tracked Capacity: %zu, Data Ptr: %p\n",
+                index_to_set, *current_capacity_ptr, (void*)((*vec_ptr)->data) ); // KEEP THIS
+        return -2; 
+    }
+
+    (*vec_ptr)->size++; 
     return 0;
 }
 
@@ -276,7 +325,7 @@ static int add_string_to_list(char*** list_ptr, int* count_ptr, int* capacity_pt
 
         char** temp_list = realloc(*list_ptr, new_capacity * sizeof(char*));
         if (!temp_list) {
-            fprintf(stderr, "add_string_to_list: Failed to realloc file list to capacity %d.\n", new_capacity);
+            //fprintf(stderr, "add_string_to_list: Failed to realloc file list to capacity %d.\n", new_capacity);
             return -1;
         }
         *list_ptr = temp_list;
@@ -286,7 +335,7 @@ static int add_string_to_list(char*** list_ptr, int* count_ptr, int* capacity_pt
     if (str_to_add != NULL) {
         (*list_ptr)[*count_ptr] = strdup(str_to_add);
         if (!(*list_ptr)[*count_ptr]) {
-            fprintf(stderr, "add_string_to_list: Failed to strdup filepath.\n");
+            //fprintf(stderr, "add_string_to_list: Failed to strdup filepath.\n");
             return -1;
         }
         (*count_ptr)++; 
@@ -297,29 +346,30 @@ static int add_string_to_list(char*** list_ptr, int* count_ptr, int* capacity_pt
     return 0;
 }
 
+// schwarzschild_tracer.c
 
-static void skip_ppm_comments_and_whitespace(FILE *fp) {
-    int ch;
-    while ((ch = fgetc(fp)) != EOF && isspace(ch)) {}
-    if (ch == '#') {
-        while ((ch = fgetc(fp)) != EOF && ch != '\n' && ch != '\r') {}
-        skip_ppm_comments_and_whitespace(fp);
-    } else if (ch != EOF) {
-        ungetc(ch, fp);
-    }
-}
+// ... (other includes, static functions like get_event_val_... etc., should be above this) ...
 
-// --- Core Trajectory Computation (integrate_photon_trajectory_core) ---
+// Define a new constant for the super-step size
+#define MAX_K_PER_GSL_SUPER_STEP .01 // Or 0.5, or 0.1. Adjust for density vs. performance.
+                                     // Smaller means more points, potentially slower.
+
+// Static variable to count calls to the core function for debugging
+static int integrate_photon_trajectory_core_call_count = 0;
+
 static int integrate_photon_trajectory_core(
     double r_0, double phi_0, double M_val, double psi, double r_max_val,
     double x_stop_val, bool x_stop_active_flag,
     const gsl_vector *x_targets_vec,
-    double t_end_max,
+    double t_end_max_overall, // Renamed for clarity
     double rtol, double atol,
-    PhotonTrajectory *full_traj_output, 
+    PhotonTrajectory *full_traj_output,
     TrajectoryCrossings *crossings_output,
     int num_interp_points_for_full_traj
 ) {
+    integrate_photon_trajectory_core_call_count++;
+    int current_call_instance = integrate_photon_trajectory_core_call_count;
+
     int core_error_code = 0;
     double K_final_reached_integration = 0.0;
 
@@ -328,14 +378,17 @@ static int integrate_photon_trajectory_core(
     size_t num_segments_collected = 0;
     size_t segments_collected_capacity = 0;
     gsl_vector *current_segment_K_temp = NULL, *current_segment_r_temp = NULL, *current_segment_phi_temp = NULL;
-    size_t current_segment_point_count = 0;
-    size_t current_segment_point_capacity = 0;
+    size_t current_segment_point_count = 0;    // Current logical size/next index to write
+    size_t current_segment_K_capacity = 0;     // Capacity for K_temp
+    size_t current_segment_r_capacity = 0;     // Capacity for r_temp
+    size_t current_segment_phi_capacity = 0;   // Capacity for phi_temp
     gsl_vector **crossings_collector_ptr = NULL;
     size_t *crossings_collector_capacities = NULL;
     size_t num_x_targets_val = 0;
     gsl_vector *K_all_raw = NULL, *r_all_raw = NULL, *phi_all_raw_temp = NULL, *phi_unwrapped_all = NULL;
     gsl_spline *spline_r_interp = NULL, *spline_phi_interp = NULL;
     gsl_interp_accel *acc_r_interp = NULL, *acc_phi_interp = NULL;
+
 
 
     if (r_0 <= (2.0 * M_val + EPSILON_GENERAL) || r_0 >= r_max_val) {
@@ -381,12 +434,47 @@ static int integrate_photon_trajectory_core(
     }
 
     double metric_r0_term = (1.0 - 2.0 * M_val / r_0);
-    if (metric_r0_term <= EPSILON_GENERAL) { K_final_reached_integration = 0.0; goto cleanup_core; }
+    if (metric_r0_term <= EPSILON_GENERAL) {K_final_reached_integration = 0.0; goto cleanup_core;}
 
     double b_val = cos(psi) * r_0 / sqrt(metric_r0_term);
-    int current_sign_dr_dk = 1;
-    double psi_norm = normalize_phi(psi);
-    if (psi_norm > M_PI && psi_norm < 2.0 * M_PI) { current_sign_dr_dk = -1; }
+    
+    // Corrected initial sign_dr_dk logic based on psi = angle with +e_phi (tangential), CCW positive
+    int current_sign_dr_dk;
+    double psi_input_for_sign = psi;
+
+    if (fabs(b_val) < 1e-9) { // Purely radial motion because b is (near) zero (cos(psi) ~ 0)
+        // This means psi is near +/- PI/2, +/- 3PI/2 etc.
+        // sin(psi) determines direction: >0 outward, <0 inward.
+        double sin_psi_val = sin(psi_input_for_sign);
+        if (sin_psi_val > EPSILON_GENERAL) {
+            current_sign_dr_dk = 1; // e.g., psi = PI/2
+        } else if (sin_psi_val < -EPSILON_GENERAL) {
+            current_sign_dr_dk = -1; // e.g., psi = -PI/2 or 3PI/2
+        } else {
+            // This implies sin(psi)=0 AND cos(psi)=0, which is impossible.
+            // Likely due to psi_input_for_sign being an imperfect multiple of PI/2 for b_val to be almost zero.
+            fprintf(stderr, "Warning: Ambiguous radial direction for b_val ~ 0 (b=%.3e, psi=%.3f). Defaulting to outward.\n", b_val, psi_input_for_sign);
+            current_sign_dr_dk = 1; 
+        }
+    } else { // Non-radial motion (b != 0)
+        // Radial component of velocity is proportional to sin(psi)
+        // psi angle from +e_phi: (0, PI) -> sin(psi)>0 -> outward. (PI, 2PI) -> sin(psi)<0 -> inward.
+        if (sin(psi_input_for_sign) > EPSILON_GENERAL) {
+            current_sign_dr_dk = 1;  // Outward radial component
+        } else if (sin(psi_input_for_sign) < -EPSILON_GENERAL) {
+            current_sign_dr_dk = -1; // Inward radial component
+        } else {
+            // sin(psi_input_for_sign) is zero, so psi is 0 or +/-PI (purely tangential as b!=0)
+            // For a particle starting far out and purely tangential, it typically moves "outward"
+            // relative to the potential well, or orbits. The fr_zero event handles true turning.
+            // Python's `psi % (2*np.pi) > np.pi` for its psi convention results in:
+            // psi=0 -> sign=1 (outward); psi=pi -> sign=1 (outward)
+            // This default +1 for purely tangential (b!=0) matches that.
+            current_sign_dr_dk = 1; 
+        }
+    }
+
+
 
     ODEParams ode_params_instance;
     ode_params_instance.M = M_val;
@@ -395,25 +483,38 @@ static int integrate_photon_trajectory_core(
 
     gsl_odeiv2_system sys = {schwarzschild_geodesic_eqs, NULL, 2, &ode_params_instance};
     
-    driver = gsl_odeiv2_driver_alloc_y_new(&sys, gsl_odeiv2_step_rkf45, 1e-6, rtol, atol);
+    double initial_driver_step = (rtol < 1e-9 || atol < 1e-9) ? 1e-5 : 1e-6;
+    driver = gsl_odeiv2_driver_alloc_y_new(&sys, gsl_odeiv2_step_rkf45, initial_driver_step, rtol, atol);
     CHECK_ALLOC_GEN_CORE(driver, "core (driver)", "gsl_odeiv2_driver", core_error_code, -2, cleanup_core);
 
-    double K_current = 0.0;
+    double K_loop_variable = 0.0; 
     double y_current_state[2] = {r_0, phi_0};
 
     if (full_traj_output) {
         segments_collected_capacity = INITIAL_SEGMENTS_CAPACITY;
         segments_collected_list = malloc(segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
-        CHECK_ALLOC_GEN_CORE(segments_collected_list, "core (segments_collected_list)", "TrajectorySegmentDataInternal array", core_error_code, -1, cleanup_core);
+        CHECK_ALLOC_GEN_CORE(segments_collected_list, "core (segments_list)", "SegList", core_error_code, -1, cleanup_core);
         for(size_t i=0; i<segments_collected_capacity; ++i) {
-            segments_collected_list[i].K_pts = NULL; segments_collected_list[i].r_pts = NULL; segments_collected_list[i].phi_pts = NULL;
+            segments_collected_list[i].K_pts = NULL; 
+            segments_collected_list[i].r_pts = NULL; 
+            segments_collected_list[i].phi_pts = NULL;
         }
-        current_segment_point_capacity = INITIAL_RAW_POINTS_CAPACITY;
-        current_segment_K_temp = gsl_vector_alloc(current_segment_point_capacity); CHECK_GSL_ALLOC_VEC_CORE(current_segment_K_temp, "core (K_temp)", "current_segment_K_temp", core_error_code, -1, cleanup_core);
-        current_segment_r_temp = gsl_vector_alloc(current_segment_point_capacity); CHECK_GSL_ALLOC_VEC_CORE(current_segment_r_temp, "core (r_temp)", "current_segment_r_temp", core_error_code, -1, cleanup_core);
-        current_segment_phi_temp = gsl_vector_alloc(current_segment_point_capacity); CHECK_GSL_ALLOC_VEC_CORE(current_segment_phi_temp, "core (phi_temp)", "current_segment_phi_temp", core_error_code, -1, cleanup_core);
+
+        // Initialize individual capacities after initial allocation
+        current_segment_K_temp = gsl_vector_alloc(INITIAL_RAW_POINTS_CAPACITY); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_K_temp, "core (K_temp init)", "K_temp", core_error_code, -1, cleanup_core);
+        current_segment_K_capacity = INITIAL_RAW_POINTS_CAPACITY; // <<<< ADD THIS
+
+        current_segment_r_temp = gsl_vector_alloc(INITIAL_RAW_POINTS_CAPACITY); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_r_temp, "core (r_temp init)", "r_temp", core_error_code, -1, cleanup_core);
+        current_segment_r_capacity = INITIAL_RAW_POINTS_CAPACITY; // <<<< ADD THIS
+
+        current_segment_phi_temp = gsl_vector_alloc(INITIAL_RAW_POINTS_CAPACITY); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_phi_temp, "core (phi_temp init)", "phi_temp", core_error_code, -1, cleanup_core);
+        current_segment_phi_capacity = INITIAL_RAW_POINTS_CAPACITY; // <<<< ADD THIS
         
-        gsl_vector_set(current_segment_K_temp, 0, K_current);
+        // Store the initial point (K=0)
+        gsl_vector_set(current_segment_K_temp, 0, K_loop_variable); 
         gsl_vector_set(current_segment_r_temp, 0, y_current_state[0]);
         gsl_vector_set(current_segment_phi_temp, 0, y_current_state[1]);
         current_segment_point_count = 1;
@@ -422,10 +523,10 @@ static int integrate_photon_trajectory_core(
     if (x_targets_vec && (full_traj_output || crossings_output)) {
         num_x_targets_val = x_targets_vec->size;
         if (num_x_targets_val > 0) {
-            crossings_collector_ptr = calloc(num_x_targets_val, sizeof(gsl_vector*)); CHECK_ALLOC_GEN_CORE(crossings_collector_ptr, "core (crossings_collector_ptr)", "gsl_vector**", core_error_code, -1, cleanup_core);
-            crossings_collector_capacities = calloc(num_x_targets_val, sizeof(size_t)); CHECK_ALLOC_GEN_CORE(crossings_collector_capacities, "core (crossings_collector_capacities)", "size_t*", core_error_code, -1, cleanup_core);
+            crossings_collector_ptr = calloc(num_x_targets_val, sizeof(gsl_vector*)); CHECK_ALLOC_GEN_CORE(crossings_collector_ptr, "core (crossings_coll_ptr)","gsl_vec**", core_error_code, -1, cleanup_core);
+            crossings_collector_capacities = calloc(num_x_targets_val, sizeof(size_t)); CHECK_ALLOC_GEN_CORE(crossings_collector_capacities, "core (crossings_coll_cap)","size_t*", core_error_code, -1, cleanup_core);
             for (size_t i = 0; i < num_x_targets_val; ++i) {
-                crossings_collector_ptr[i] = gsl_vector_alloc(INITIAL_CROSSING_POINTS_CAPACITY); CHECK_GSL_ALLOC_VEC_CORE(crossings_collector_ptr[i], "core (crossings_collector_ptr[i])", "crossings_collector_ptr[i]", core_error_code, -1, cleanup_core);
+                crossings_collector_ptr[i] = gsl_vector_alloc(INITIAL_CROSSING_POINTS_CAPACITY); CHECK_GSL_ALLOC_VEC_CORE(crossings_collector_ptr[i], "core (crossings_coll[i])","coll[i]", core_error_code, -1, cleanup_core);
                 gsl_vector_set_zero(crossings_collector_ptr[i]);
                 crossings_collector_ptr[i]->size = 0;
                 crossings_collector_capacities[i] = INITIAL_CROSSING_POINTS_CAPACITY;
@@ -433,148 +534,225 @@ static int integrate_photon_trajectory_core(
         }
     }
 
-    #define MAX_EVENT_TYPES_CORE 100
+    #define MAX_EVENT_TYPES_CORE 100 // Already defined in header, but ensure scope if not
     EventFunctionParams event_params_instances[MAX_EVENT_TYPES_CORE];
     double (*event_get_val_func_ptrs[MAX_EVENT_TYPES_CORE])(double, const double[], EventFunctionParams*);
     bool event_is_terminal[MAX_EVENT_TYPES_CORE];
     int event_crossing_dir[MAX_EVENT_TYPES_CORE];
-    int event_is_x_target_idx_map[MAX_EVENT_TYPES_CORE];
+    int event_is_x_target_idx_map[MAX_EVENT_TYPES_CORE]; 
     size_t num_active_event_funcs = 0;
 
+    // ... (Event setup for fr_zero, r_leq_2M, r_max, x_stop, x_targets - this was correct) ...
+    // Event 0: fr_zero (turning point)
     event_params_instances[num_active_event_funcs].ode_p_event = &ode_params_instance;
     event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_fr_zero;
     event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = 0;
     event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
 
-    event_params_instances[num_active_event_funcs].M = M_val;
+    // Event 1: r_leq_2M (capture)
+    event_params_instances[num_active_event_funcs].M = M_val; 
     event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_r_leq_2M;
     event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = -1;
     event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
 
+    // Event 2: r_max (escape)
     event_params_instances[num_active_event_funcs].r_max_event = r_max_val;
     event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_r_max;
-    event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = 1;
+    event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = 1; 
     event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
-
+    
     if (x_stop_active_flag) {
         event_params_instances[num_active_event_funcs].x_stop_event = x_stop_val;
         event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_x_stop;
-        event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = -1;
+        event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = -1; 
         event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
     }
+
     if (x_targets_vec && num_x_targets_val > 0) {
         for (size_t i = 0; i < num_x_targets_val; ++i) {
-            if (num_active_event_funcs >= MAX_EVENT_TYPES_CORE) { core_error_code = -2; goto cleanup_core; }
+            if (num_active_event_funcs >= MAX_EVENT_TYPES_CORE) { 
+                fprintf(stderr, "Too many event types defined.\n"); core_error_code = -2; goto cleanup_core;
+            }
             event_params_instances[num_active_event_funcs].x_target_event = gsl_vector_get(x_targets_vec, i);
             event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_x_target;
-            event_is_terminal[num_active_event_funcs] = false;
-            event_crossing_dir[num_active_event_funcs] = -1;
-            event_is_x_target_idx_map[num_active_event_funcs] = i; num_active_event_funcs++;
+            event_is_terminal[num_active_event_funcs] = false; 
+            event_crossing_dir[num_active_event_funcs] = -1;   
+            event_is_x_target_idx_map[num_active_event_funcs] = (int)i; 
+            num_active_event_funcs++;
         }
     }
 
-    int integration_stop_code = 0;
+
+    int integration_stop_code = 0; 
     int safety_break_counter = 0;
-    const int MAX_SAFETY_BREAK_CORE = 200000;
+    const int MAX_SAFETY_BREAK_CORE = 200000; 
+    const double MIN_K_PROGRESS_PER_ITER = 1e-12; 
 
-    while (K_current < t_end_max && integration_stop_code == 0 && safety_break_counter < MAX_SAFETY_BREAK_CORE) {
+    while (K_loop_variable < t_end_max_overall && integration_stop_code == 0 && safety_break_counter < MAX_SAFETY_BREAK_CORE) {
         safety_break_counter++;
-        double K_before_this_step = K_current;
-        double y_before_this_step[2]; memcpy(y_before_this_step, y_current_state, 2 * sizeof(double));
+        double K_iter_start_val = K_loop_variable; 
+        double y_iter_start_state[2]; 
+        memcpy(y_iter_start_state, y_current_state, 2 * sizeof(double));
 
-        int status = gsl_odeiv2_driver_apply(driver, &K_current, t_end_max, y_current_state);
+        double K_target_for_this_gsl_step = K_iter_start_val + MAX_K_PER_GSL_SUPER_STEP;
+        if (K_target_for_this_gsl_step > t_end_max_overall) {
+            K_target_for_this_gsl_step = t_end_max_overall;
+        }
+        
+        if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER && K_iter_start_val >= t_end_max_overall - EPSILON_GENERAL) {
+            integration_stop_code = 1; 
+            K_final_reached_integration = t_end_max_overall;
+            K_loop_variable = t_end_max_overall;
+            break;
+        }
+        if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER) {
+            // Try a much smaller fraction of the super step if the full super step is too small
+            K_target_for_this_gsl_step = K_iter_start_val + MAX_K_PER_GSL_SUPER_STEP * 0.01; 
+             if (K_target_for_this_gsl_step > t_end_max_overall) K_target_for_this_gsl_step = t_end_max_overall;
+             if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER){
+                  integration_stop_code = 1;
+                  K_final_reached_integration = t_end_max_overall;
+                  K_loop_variable = t_end_max_overall;
+                  break;
+             }
+        }
+        
+        
+        double K_gsl_inout = K_iter_start_val; 
+        int status = gsl_odeiv2_driver_apply(driver, &K_gsl_inout, K_target_for_this_gsl_step, y_current_state);
+        double K_gsl_step_end = K_gsl_inout; 
+
 
         if (status != GSL_SUCCESS) {
-            fprintf(stderr, "GSL ODE solver error: %s (K=%.2e, r=%.2e, phi=%.2e)\n", gsl_strerror(status), K_before_this_step, y_before_this_step[0], y_before_this_step[1]);
-            integration_stop_code = 3; K_final_reached_integration = K_before_this_step; break;
+            fprintf(stderr, "GSL ODE solver error: %s (K_start_iter=%.2e, r=%.2e, phi=%.2e)\n", gsl_strerror(status), K_iter_start_val, y_iter_start_state[0], y_iter_start_state[1]);
+            integration_stop_code = 3; K_final_reached_integration = K_iter_start_val; break;
         }
-        K_final_reached_integration = K_current;
+
+        if (fabs(K_gsl_step_end - K_iter_start_val) < DBL_EPSILON * fabs(K_iter_start_val) + 10.0 * DBL_MIN) {
+            if (safety_break_counter > 50) { 
+                fprintf(stderr, "Warning: GSL ODE solver stalled at K=%.15e (K_start_iter=%.15e, h=%.3e). Terminating integration.\n", 
+                        K_gsl_step_end, K_iter_start_val, driver->h);
+                integration_stop_code = 4; 
+                K_final_reached_integration = K_gsl_step_end; 
+                break;
+            }
+        }
+        K_final_reached_integration = K_gsl_step_end; 
 
         if (full_traj_output) {
-            if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
-                reallocate_gsl_vector_if_needed(&current_segment_r_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
-                reallocate_gsl_vector_if_needed(&current_segment_phi_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
-                integration_stop_code = 3; K_final_reached_integration = K_before_this_step; break;
+            // Pass the correct individual capacity variable for each vector
+            if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, current_segment_point_count, &current_segment_K_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                reallocate_gsl_vector_if_needed(&current_segment_r_temp, current_segment_point_count, &current_segment_r_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                reallocate_gsl_vector_if_needed(&current_segment_phi_temp, current_segment_point_count, &current_segment_phi_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
+                integration_stop_code = 3; K_final_reached_integration = K_iter_start_val; break; 
             }
-            gsl_vector_set(current_segment_K_temp, current_segment_point_count, K_current);
-            gsl_vector_set(current_segment_r_temp, current_segment_point_count, y_current_state[0]);
+            gsl_vector_set(current_segment_K_temp, current_segment_point_count, K_gsl_step_end);
+            gsl_vector_set(current_segment_r_temp, current_segment_point_count, y_current_state[0]); 
             gsl_vector_set(current_segment_phi_temp, current_segment_point_count, y_current_state[1]);
+
+            
             current_segment_point_count++;
         }
 
-        double earliest_K_event_this_step = K_current + 1.0;
+        double earliest_K_event_this_step = K_gsl_step_end + 1.0; 
         int triggered_event_func_original_idx = -1;
         double y_at_earliest_event_this_step[2];
-        y_at_earliest_event_this_step[0] = NAN; y_at_earliest_event_this_step[1] = NAN; // Initialize
+        y_at_earliest_event_this_step[0] = NAN; y_at_earliest_event_this_step[1] = NAN;
 
         for (size_t ev_idx = 0; ev_idx < num_active_event_funcs; ++ev_idx) {
             double K_event_found_type; double y_event_found_type[2];
             int event_found_flag = find_event_time_gsl(
-                K_before_this_step, y_before_this_step, K_current, y_current_state,
+                K_iter_start_val, y_iter_start_state,    
+                K_gsl_step_end, y_current_state,         
                 event_get_val_func_ptrs[ev_idx], &event_params_instances[ev_idx],
                 event_crossing_dir[ev_idx], &K_event_found_type, y_event_found_type
             );
 
-            if (event_found_flag && K_event_found_type >= K_before_this_step - EVENT_DETECTION_TOLERANCE && K_event_found_type <= K_current + EVENT_DETECTION_TOLERANCE) {
-                if (K_event_found_type < earliest_K_event_this_step) {
-                    earliest_K_event_this_step = K_event_found_type;
-                    triggered_event_func_original_idx = ev_idx;
-                    memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
-                } else if (fabs(K_event_found_type - earliest_K_event_this_step) < EVENT_DETECTION_TOLERANCE * 0.1) {
-                    if (event_get_val_func_ptrs[ev_idx] == get_event_val_fr_zero) {
-                        earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
-                    } else if (event_get_val_func_ptrs[ev_idx] == get_event_val_r_leq_2M && event_get_val_func_ptrs[triggered_event_func_original_idx] != get_event_val_fr_zero) {
-                        earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+            if (event_found_flag) {
+                bool accept_this_specific_event = false;
+                if (event_is_terminal[ev_idx]) {
+                    if (K_event_found_type >= K_iter_start_val - EVENT_DETECTION_TOLERANCE &&
+                        K_event_found_type <= K_gsl_step_end + EVENT_DETECTION_TOLERANCE) {
+                        accept_this_specific_event = true;
+                    }
+                } else { 
+                    if (K_event_found_type > K_iter_start_val + (EVENT_DETECTION_TOLERANCE * 0.1) && 
+                        K_event_found_type <= K_gsl_step_end + EVENT_DETECTION_TOLERANCE) {
+                        accept_this_specific_event = true;
+                    }
+                }
+
+                if (accept_this_specific_event) {
+                    if (K_event_found_type < earliest_K_event_this_step) {
+                        earliest_K_event_this_step = K_event_found_type;
+                        triggered_event_func_original_idx = ev_idx;
+                        memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                    } else if (fabs(K_event_found_type - earliest_K_event_this_step) < EVENT_DETECTION_TOLERANCE * 0.01) {
+                        if (event_get_val_func_ptrs[ev_idx] == get_event_val_fr_zero) { 
+                            earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                        } else if (event_get_val_func_ptrs[ev_idx] == get_event_val_r_leq_2M && event_get_val_func_ptrs[triggered_event_func_original_idx] != get_event_val_fr_zero) {
+                            earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                        }
                     }
                 }
             }
-        }
+        } 
 
-        if (triggered_event_func_original_idx != -1) {
-            K_final_reached_integration = earliest_K_event_this_step;
-            K_current = earliest_K_event_this_step;
-            memcpy(y_current_state, y_at_earliest_event_this_step, 2 * sizeof(double));
+        if (triggered_event_func_original_idx != -1) { 
+
+            K_loop_variable = earliest_K_event_this_step; 
+            memcpy(y_current_state, y_at_earliest_event_this_step, 2 * sizeof(double)); 
+            K_final_reached_integration = K_loop_variable; 
 
             if (full_traj_output && current_segment_point_count > 0) {
-                size_t last_idx_in_temp = current_segment_point_count - 1;
-                gsl_vector_set(current_segment_K_temp, last_idx_in_temp, K_current);
-                gsl_vector_set(current_segment_r_temp, last_idx_in_temp, y_current_state[0]);
-                gsl_vector_set(current_segment_phi_temp, last_idx_in_temp, y_current_state[1]);
+                size_t last_idx_in_temp = current_segment_point_count - 1; 
+                gsl_vector_set(current_segment_K_temp, last_idx_in_temp, K_loop_variable); 
+                gsl_vector_set(current_segment_r_temp, last_idx_in_temp, y_current_state[0]); 
+                gsl_vector_set(current_segment_phi_temp, last_idx_in_temp, y_current_state[1]); 
             }
 
             int x_target_list_idx = event_is_x_target_idx_map[triggered_event_func_original_idx];
-            if (x_target_list_idx != -1) {
+            if (x_target_list_idx != -1) { 
                 if (crossings_collector_ptr && x_target_list_idx < (int)num_x_targets_val) {
                     double r_event_val = y_at_earliest_event_this_step[0];
-                    if (r_event_val >= (2 * M_val + EPSILON_GENERAL) && r_event_val >= 1e-10) {
+                    if (r_event_val >= (2 * M_val + EPSILON_GENERAL) && r_event_val >= 1e-10) { 
                         double y_val_to_add_crossing = y_at_earliest_event_this_step[0] * sin(y_at_earliest_event_this_step[1]);
+
                         if (gsl_vector_dynamic_append(&crossings_collector_ptr[x_target_list_idx], y_val_to_add_crossing, &crossings_collector_capacities[x_target_list_idx]) != 0) {
-                            integration_stop_code = 3; break;
+                            integration_stop_code = 3; K_final_reached_integration = K_loop_variable; break;
                         }
                     }
                 }
-            } else if (event_is_terminal[triggered_event_func_original_idx]) {
-                if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_fr_zero) {
+                K_loop_variable += EVENT_DETECTION_TOLERANCE * 10.0; 
+                K_final_reached_integration = K_loop_variable; 
+            } else if (event_is_terminal[triggered_event_func_original_idx]) { 
+                if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_fr_zero) { 
                     current_sign_dr_dk *= -1;
-                    y_current_state[0] += 1e-7 * current_sign_dr_dk;
-                    K_current += 1e-7;
-                    K_final_reached_integration = K_current;
+                    //y_current_state[0] += (EVENT_DETECTION_TOLERANCE * 10.0) * current_sign_dr_dk; 
+                    //K_loop_variable += EVENT_DETECTION_TOLERANCE * 10.0;
+                    y_current_state[0] += (1e-7) * current_sign_dr_dk; // Match Python's r nudge
+                    K_loop_variable += 1e-7;  
+                    K_final_reached_integration = K_loop_variable;
 
                     if (y_current_state[0] <= (2*M_val + EPSILON_GENERAL) || y_current_state[0] >= r_max_val ||
                         (x_stop_active_flag && (y_current_state[0]*cos(y_current_state[1]) <= x_stop_val + EPSILON_GENERAL))) {
-                        integration_stop_code = 2; break;
+
+
+                        integration_stop_code = 2; 
                     }
 
-                    if (full_traj_output) {
+                    if (full_traj_output && integration_stop_code != 2) { 
                         if (num_segments_collected >= segments_collected_capacity) {
                             segments_collected_capacity = (segments_collected_capacity == 0) ? INITIAL_SEGMENTS_CAPACITY : segments_collected_capacity * 2;
                             TrajectorySegmentDataInternal *temp_realloc = realloc(segments_collected_list, segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
-                            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc segments_list)", "TrajectorySegmentDataInternal array", integration_stop_code, 3, cleanup_core_loop);
+                            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc seg_list)", "SegList", integration_stop_code, 3, cleanup_core); // Use main cleanup on alloc fail here
                             segments_collected_list = temp_realloc;
                         }
-                        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (seg K)", "segment K_pts", integration_stop_code, 3, cleanup_core_loop);
-                        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (seg r)", "segment r_pts", integration_stop_code, 3, cleanup_core_loop);
-                        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (seg phi)", "segment phi_pts", integration_stop_code, 3, cleanup_core_loop);
+                        
+                        
+                        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (seg K)", "K_seg", integration_stop_code, 3, cleanup_core);
+                        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (seg r)", "r_seg", integration_stop_code, 3, cleanup_core);
+                        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (seg phi)", "phi_seg", integration_stop_code, 3, cleanup_core);
                         
                         for(size_t k=0; k<current_segment_point_count; ++k) {
                             gsl_vector_set(segments_collected_list[num_segments_collected].K_pts, k, gsl_vector_get(current_segment_K_temp, k));
@@ -583,93 +761,205 @@ static int integrate_photon_trajectory_core(
                         }
                         num_segments_collected++;
                         current_segment_point_count = 0; 
-                        if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
-                            reallocate_gsl_vector_if_needed(&current_segment_r_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
-                            reallocate_gsl_vector_if_needed(&current_segment_phi_temp, current_segment_point_count, &current_segment_point_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
-                            integration_stop_code = 3; K_final_reached_integration = K_before_this_step; break;
-                        }
-                        gsl_vector_set(current_segment_K_temp, current_segment_point_count, K_current);
-                        gsl_vector_set(current_segment_r_temp, current_segment_point_count, y_current_state[0]);
-                        gsl_vector_set(current_segment_phi_temp, current_segment_point_count, y_current_state[1]);
-                        current_segment_point_count = 1;
+                        // Start new segment with the nudged state
+                        if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, 0, &current_segment_K_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                        reallocate_gsl_vector_if_needed(&current_segment_r_temp, 0, &current_segment_r_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                        reallocate_gsl_vector_if_needed(&current_segment_phi_temp, 0, &current_segment_phi_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
+                        integration_stop_code = 3; K_final_reached_integration = K_loop_variable; break;
                     }
-                } else {
-                    integration_stop_code = 2; break;
-                }
-            }
-        }
-    cleanup_core_loop: {} 
-        if (integration_stop_code == 3) { break; }
+                    // Since current_segment_point_count is 0, these set the first element (index 0) of the new segment
+                    gsl_vector_set(current_segment_K_temp, 0, K_loop_variable);
+                    gsl_vector_set(current_segment_r_temp, 0, y_current_state[0]);
+                    gsl_vector_set(current_segment_phi_temp, 0, y_current_state[1]);
+                    current_segment_point_count = 1; 
+                
 
-        if (K_current >= t_end_max - EPSILON_GENERAL) { integration_stop_code = 1; K_final_reached_integration = t_end_max; }
-    }
+                        if (current_call_instance == 1 && num_segments_collected == 1) { // We are building the second segment
+                        if (current_segment_point_count == 255 || current_segment_point_count == 256 || current_segment_point_count == 257) {
+                        printf("DEBUG_SEG1_BUILD (Iter %d, Seg1_LocalIdx %zu): K_gsl_step_end=%.15e, r=%.3e, phi=%.3e. Stored K=%.15e\n",
+                       safety_break_counter,
+                       current_segment_point_count, // This is the index where it's about to be written
+                       K_gsl_step_end,
+                       y_current_state[0],
+                       y_current_state[1],
+                       gsl_vector_get(current_segment_K_temp, current_segment_point_count) // Read back what was just written
+                       );
+                        fflush(stdout);
+                        }
+                        
+
+                        }
+
+
+                        current_segment_point_count = 1;
+                     
+                    }
+                    } else {  integration_stop_code = 2; // This 'else' handles OTHER terminal events (NOT fr_zero)
+                    char event_name[50] = "Unknown";
+                    if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_r_leq_2M) {
+                        strcpy(event_name, "r_leq_2M");
+                    } else if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_r_max) {
+                        strcpy(event_name, "r_max");
+                    } else if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_x_stop) {
+                        strcpy(event_name, "x_stop");
+                    }
+                    // Add more 'else if' for any other distinct terminal event types
+
+                    integration_stop_code = 2; // Terminate integration due to this event
+                }
+
+
+                
+
+                
+            }
+
+        // Near the end of the if (triggered_event_func_original_idx != -1) block
+        } else { 
+            K_loop_variable = K_gsl_step_end; 
+        }
+
+        if (integration_stop_code != 0) { break; } 
+
+        if (K_loop_variable >= t_end_max_overall - EPSILON_GENERAL) { 
+            integration_stop_code = 1; 
+            K_final_reached_integration = t_end_max_overall; 
+            K_loop_variable = t_end_max_overall; 
+        }
+        if (fabs(K_loop_variable - K_iter_start_val) < MIN_K_PROGRESS_PER_ITER && safety_break_counter > 100 && integration_stop_code == 0) {
+            fprintf(stderr, "Warning: Minimal K progress in iteration %d (K_start_iter=%.15e, K_loop_var_end_iter=%.15e). Terminating.\n",
+                    safety_break_counter, K_iter_start_val, K_loop_variable);
+            integration_stop_code = 5; 
+            K_final_reached_integration = K_loop_variable;
+            break;
+        }
+    } 
 
     if (safety_break_counter >= MAX_SAFETY_BREAK_CORE) {
-        fprintf(stderr, "Warning: Max safety break counter reached in integration loop.\n");
-        if (integration_stop_code == 0) { integration_stop_code = 2; }
+        fprintf(stderr, "Warning: Max safety break counter (%d) reached. K_final=%.15e\n", MAX_SAFETY_BREAK_CORE, K_final_reached_integration);
+        if (integration_stop_code == 0) { integration_stop_code = 2; } 
     }
+    // ... (other termination messages integration_stop_code 4, 5) ...
 
-    if (full_traj_output && current_segment_point_count > 0 && integration_stop_code != 3) {
+    // --- Final Segment Storage (if any points remain in current_segment_...) ---
+    if (full_traj_output && current_segment_point_count > 0 && integration_stop_code != 3) { 
         if (num_segments_collected >= segments_collected_capacity) {
             segments_collected_capacity = (segments_collected_capacity == 0) ? INITIAL_SEGMENTS_CAPACITY : segments_collected_capacity * 2;
             TrajectorySegmentDataInternal *temp_realloc = realloc(segments_collected_list, segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
-            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc final segments_list)", "TrajectorySegmentDataInternal array", integration_stop_code, 3, cleanup_core_post_loop);
+            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc final seg_list)", "SegList", integration_stop_code, 3, cleanup_core_post_loop); 
             segments_collected_list = temp_realloc;
         }
-        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (final seg K)", "final segment K_pts", integration_stop_code, 3, cleanup_core_post_loop);
-        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (final seg r)", "final segment r_pts", integration_stop_code, 3, cleanup_core_post_loop);
-        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (final seg phi)", "final segment phi_pts", integration_stop_code, 3, cleanup_core_post_loop);
+        // This segment K_pts etc should be allocated with current_segment_point_count
+        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (final K_seg)", "K_seg", integration_stop_code, 3, cleanup_core_post_loop);
+        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (final r_seg)", "r_seg", integration_stop_code, 3, cleanup_core_post_loop);
+        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (final phi_seg)", "phi_seg", integration_stop_code, 3, cleanup_core_post_loop);
         
         for(size_t k=0; k<current_segment_point_count; ++k) {
             gsl_vector_set(segments_collected_list[num_segments_collected].K_pts, k, gsl_vector_get(current_segment_K_temp, k));
             gsl_vector_set(segments_collected_list[num_segments_collected].r_pts, k, gsl_vector_get(current_segment_r_temp, k));
             gsl_vector_set(segments_collected_list[num_segments_collected].phi_pts, k, gsl_vector_get(current_segment_phi_temp, k));
         }
+
+        
         num_segments_collected++;
     }
 cleanup_core_post_loop: {} 
 
-    if (full_traj_output && integration_stop_code != 3) {
-        if (num_segments_collected == 0 && fabs(K_final_reached_integration - 0.0) < DBL_EPSILON &&
+
+
+    // --- Interpolation Logic ---
+    // Check if full trajectory output is requested and no critical error occurred during integration
+    if (full_traj_output && integration_stop_code != 3 && integration_stop_code != 4 && integration_stop_code != 5) {
+        
+        // Scenario 1: Trivial case where output might have been pre-filled by the function's initial r0 checks.
+        if (num_segments_collected == 0 && 
+            fabs(K_final_reached_integration - 0.0) < DBL_EPSILON &&
             (full_traj_output->K && full_traj_output->K->size >= 1 && fabs(gsl_vector_get(full_traj_output->K,0) - 0.0) < DBL_EPSILON)) {
-            // Trivial case already handled
-        } else if (num_segments_collected > 0 && K_final_reached_integration >= -EPSILON_GENERAL) {
+            // Data was likely set by the initial trivial case handler. No further interpolation needed.
+
+        } 
+        // Scenario 2: Segments were collected, and integration ended reasonably. Proceed to interpolate.
+        else if (num_segments_collected > 0 && K_final_reached_integration >= -EPSILON_GENERAL) {
             size_t total_raw_points = 0;
             for (size_t s = 0; s < num_segments_collected; ++s) {
-                total_raw_points += segments_collected_list[s].K_pts->size;
+                if (segments_collected_list[s].K_pts) { 
+                     total_raw_points += segments_collected_list[s].K_pts->size;
+                } else {
+                    fprintf(stderr, "Warning C%d: Null K_pts in segment %zu during interpolation prep.\n", current_call_instance, s);
+                }
             }
 
-            if (total_raw_points >= 1) {
+
+            if (total_raw_points >= 1) { 
                 int n_pts_interp_actual = (num_interp_points_for_full_traj > 0) ? num_interp_points_for_full_traj : 1;
+                
                 if (full_traj_output->K == NULL || full_traj_output->K->size != (size_t)n_pts_interp_actual) {
-                    gsl_vector_free(full_traj_output->K); gsl_vector_free(full_traj_output->r);
-                    gsl_vector_free(full_traj_output->phi); gsl_vector_free(full_traj_output->x); gsl_vector_free(full_traj_output->y);
-                    full_traj_output->K = gsl_vector_alloc(n_pts_interp_actual); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->K, "core (interp K)", "interp K", integration_stop_code, 3, cleanup_core_interp);
-                    full_traj_output->r = gsl_vector_alloc(n_pts_interp_actual); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->r, "core (interp r)", "interp r", integration_stop_code, 3, cleanup_core_interp);
-                    full_traj_output->phi = gsl_vector_alloc(n_pts_interp_actual); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->phi, "core (interp phi)", "interp phi", integration_stop_code, 3, cleanup_core_interp);
-                    full_traj_output->x = gsl_vector_alloc(n_pts_interp_actual); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->x, "core (interp x)", "interp x", integration_stop_code, 3, cleanup_core_interp);
-                    full_traj_output->y = gsl_vector_alloc(n_pts_interp_actual); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->y, "core (interp y)", "interp y", integration_stop_code, 3, cleanup_core_interp);
+                    gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;
+                    gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;
+                    gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;
+                    gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;
+                    gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;
+                    
+                    full_traj_output->K = gsl_vector_calloc(n_pts_interp_actual); // Use calloc for safety
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->K, "core (interp K)", "K", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->r = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->r, "core (interp r)", "r", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->phi = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->phi, "core (interp phi)", "phi", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->x = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->x, "core (interp x)", "x", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->y = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->y, "core (interp y)", "y", integration_stop_code, 3, cleanup_core_interp);
                 }
 
-                K_all_raw = gsl_vector_alloc(total_raw_points); CHECK_GSL_ALLOC_VEC_CORE(K_all_raw, "core (K_all_raw)", "K_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
-                r_all_raw = gsl_vector_alloc(total_raw_points); CHECK_GSL_ALLOC_VEC_CORE(r_all_raw, "core (r_all_raw)", "r_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
-                phi_all_raw_temp = gsl_vector_alloc(total_raw_points); CHECK_GSL_ALLOC_VEC_CORE(phi_all_raw_temp, "core (phi_all_raw_temp)", "phi_all_raw_temp", integration_stop_code, 3, cleanup_core_interp_arrays);
+                K_all_raw = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(K_all_raw, "core (K_all_raw)", "K_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
+                r_all_raw = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(r_all_raw, "core (r_all_raw)", "r_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
+                phi_all_raw_temp = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(phi_all_raw_temp, "core (phi_all_raw_temp)", "phi_all_raw_temp", integration_stop_code, 3, cleanup_core_interp_arrays);
 
                 size_t current_concat_idx = 0;
                 for (size_t s = 0; s < num_segments_collected; ++s) {
+                     if (!segments_collected_list[s].K_pts || segments_collected_list[s].K_pts->size == 0) continue; 
                     for (size_t i = 0; i < segments_collected_list[s].K_pts->size; ++i) {
-                        gsl_vector_set(K_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].K_pts, i));
-                        gsl_vector_set(r_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].r_pts, i));
-                        gsl_vector_set(phi_all_raw_temp, current_concat_idx, gsl_vector_get(segments_collected_list[s].phi_pts, i));
-                        current_concat_idx++;
+                        if (current_concat_idx < total_raw_points) { 
+                            gsl_vector_set(K_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].K_pts, i));
+                            gsl_vector_set(r_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].r_pts, i));
+                            gsl_vector_set(phi_all_raw_temp, current_concat_idx, gsl_vector_get(segments_collected_list[s].phi_pts, i));
+                            current_concat_idx++;
+                        } else {
+                            fprintf(stderr, "Warning C%d: Concatenation index %zu exceeded total_raw_points %zu.\n", current_call_instance, current_concat_idx, total_raw_points);
+                            goto end_concat_loop; 
+                        }
                     }
                 }
+                end_concat_loop:;
+                
+                if (current_concat_idx < total_raw_points) {
+                    fprintf(stderr, "Warning C%d: Final concatenated points (%zu) < initially calculated total_raw_points (%zu). Using actual count.\n", current_call_instance, current_concat_idx, total_raw_points);
+                    total_raw_points = current_concat_idx;
+                     if (total_raw_points == 0) {
+                        fprintf(stderr, "Error C%d: No valid raw points to interpolate after concat adjustments.\n", current_call_instance);
+                        if (full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+                        // (and r,phi,x,y)
+                        goto cleanup_core_interp_arrays; 
+                     }
+                }
+                
 
-                phi_unwrapped_all = gsl_vector_alloc(total_raw_points); CHECK_GSL_ALLOC_VEC_CORE(phi_unwrapped_all, "core (phi_unwrapped_all)", "phi_unwrapped_all", integration_stop_code, 3, cleanup_core_interp_arrays);
-                unwrap_phi_values(K_all_raw, phi_all_raw_temp, phi_unwrapped_all);
+                phi_unwrapped_all = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(phi_unwrapped_all, "core (phi_unwrapped)", "phi_unwrapped", integration_stop_code, 3, cleanup_core_interp_arrays);
+                
+                gsl_vector_const_view K_all_raw_v = gsl_vector_const_subvector(K_all_raw, 0, total_raw_points);
+                gsl_vector_const_view phi_all_raw_temp_v = gsl_vector_const_subvector(phi_all_raw_temp, 0, total_raw_points);
+                unwrap_phi_values(&K_all_raw_v.vector, &phi_all_raw_temp_v.vector, phi_unwrapped_all);
+                
+                
 
-                if (total_raw_points == 1) {
-                    for (size_t i = 0; i < full_traj_output->K->size; ++i) {
+
+                if (total_raw_points == 1) { 
+                    for (size_t i = 0; i < full_traj_output->K->size; ++i) { 
                         gsl_vector_set(full_traj_output->K, i, gsl_vector_get(K_all_raw, 0));
                         double r_val = gsl_vector_get(r_all_raw, 0);
                         double phi_val_norm = normalize_phi(gsl_vector_get(phi_unwrapped_all, 0));
@@ -678,33 +968,47 @@ cleanup_core_post_loop: {}
                         gsl_vector_set(full_traj_output->x, i, r_val * cos(phi_val_norm));
                         gsl_vector_set(full_traj_output->y, i, r_val * sin(phi_val_norm));
                     }
-                } else {
-                    const gsl_interp_type *spline_type_cspline_ptr = gsl_interp_cspline;
-                    const gsl_interp_type *spline_type_linear_ptr = gsl_interp_linear;
-                    const gsl_interp_type *spline_type = (total_raw_points >= gsl_interp_type_min_size(spline_type_cspline_ptr)) ? spline_type_cspline_ptr : spline_type_linear_ptr;
+                } else { // total_raw_points > 1
 
-                    spline_r_interp = gsl_spline_alloc(spline_type, total_raw_points); CHECK_ALLOC_GEN_CORE(spline_r_interp, "core (spline_r)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
-                    spline_phi_interp = gsl_spline_alloc(spline_type, total_raw_points); CHECK_ALLOC_GEN_CORE(spline_phi_interp, "core (spline_phi)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
-                    acc_r_interp = gsl_interp_accel_alloc(); CHECK_ALLOC_GEN_CORE(acc_r_interp, "core (acc_r)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
-                    acc_phi_interp = gsl_interp_accel_alloc(); CHECK_ALLOC_GEN_CORE(acc_phi_interp, "core (acc_phi)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
+                    const gsl_interp_type *spline_type_cspline = gsl_interp_cspline;
+                    const gsl_interp_type *spline_type_linear = gsl_interp_linear;
+                    const gsl_interp_type *spline_type = (total_raw_points >= gsl_interp_type_min_size(spline_type_cspline)) ? spline_type_cspline : spline_type_linear;
 
-                    gsl_spline_init(spline_r_interp, K_all_raw->data, r_all_raw->data, total_raw_points);
-                    gsl_spline_init(spline_phi_interp, K_all_raw->data, phi_unwrapped_all->data, total_raw_points);
+                    spline_r_interp = gsl_spline_alloc(spline_type, total_raw_points); 
+                    CHECK_ALLOC_GEN_CORE(spline_r_interp, "core (spline_r)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
+                    spline_phi_interp = gsl_spline_alloc(spline_type, total_raw_points); 
+                    CHECK_ALLOC_GEN_CORE(spline_phi_interp, "core (spline_phi)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
+                    acc_r_interp = gsl_interp_accel_alloc(); 
+                    CHECK_ALLOC_GEN_CORE(acc_r_interp, "core (acc_r)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
+                    acc_phi_interp = gsl_interp_accel_alloc(); 
+                    CHECK_ALLOC_GEN_CORE(acc_phi_interp, "core (acc_phi)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
 
-                    double K_interp_start = gsl_vector_get(K_all_raw, 0);
-                    double K_interp_end = K_final_reached_integration;
+                    gsl_vector_const_view r_all_raw_v = gsl_vector_const_subvector(r_all_raw, 0, total_raw_points);
+                    
+                    gsl_spline_init(spline_r_interp, K_all_raw_v.vector.data, r_all_raw_v.vector.data, total_raw_points);
+                    gsl_spline_init(spline_phi_interp, K_all_raw_v.vector.data, phi_unwrapped_all->data, total_raw_points);
+
+                    double K_interp_val_start = gsl_vector_get(&K_all_raw_v.vector, 0);
+                    double K_interp_val_end = K_final_reached_integration; 
+                                        
+                    if (K_interp_val_end < K_interp_val_start - EPSILON_GENERAL) { 
+                         fprintf(stderr, "Warning C%d: K_interp_val_end (%.15e) < K_interp_val_start (%.15e) for spline. Using K_interp_val_start as end.\n", current_call_instance, K_interp_val_end, K_interp_val_start);
+                         K_interp_val_end = K_interp_val_start;
+                    }
 
                     for (size_t i = 0; i < full_traj_output->K->size; ++i) {
-                        double K_val_interp = (full_traj_output->K->size > 1) ?
-                            (K_interp_start + (double)i * (K_interp_end - K_interp_start) / (double)(full_traj_output->K->size - 1)) : K_interp_end;
-                        if (K_interp_end < K_interp_start && full_traj_output->K->size > 1) { K_val_interp = K_interp_start; }
-                        K_val_interp = fmax(K_interp_start, fmin(K_interp_end, K_val_interp));
+                        double K_val_to_eval = (full_traj_output->K->size > 1) ?
+                            (K_interp_val_start + (double)i * (K_interp_val_end - K_interp_val_start) / (double)(full_traj_output->K->size - 1)) : K_interp_val_end;
+                        
+                        double K_spline_data_start = gsl_vector_get(K_all_raw, 0); 
+                        double K_spline_data_end = gsl_vector_get(K_all_raw, total_raw_points - 1);
+                        K_val_to_eval = fmax(K_spline_data_start, fmin(K_spline_data_end, K_val_to_eval)); 
 
-                        double r_val = gsl_spline_eval(spline_r_interp, K_val_interp, acc_r_interp);
-                        double phi_unwrapped_val = gsl_spline_eval(spline_phi_interp, K_val_interp, acc_phi_interp);
+                        double r_val = gsl_spline_eval(spline_r_interp, K_val_to_eval, acc_r_interp);
+                        double phi_unwrapped_val = gsl_spline_eval(spline_phi_interp, K_val_to_eval, acc_phi_interp);
                         double phi_val_norm = normalize_phi(phi_unwrapped_val);
 
-                        gsl_vector_set(full_traj_output->K, i, K_val_interp);
+                        gsl_vector_set(full_traj_output->K, i, K_val_to_eval);
                         gsl_vector_set(full_traj_output->r, i, r_val);
                         gsl_vector_set(full_traj_output->phi, i, phi_val_norm);
                         gsl_vector_set(full_traj_output->x, i, r_val * cos(phi_val_norm));
@@ -715,64 +1019,122 @@ cleanup_core_post_loop: {}
                     if(spline_phi_interp) { gsl_spline_free(spline_phi_interp); spline_phi_interp = NULL; }
                     if(acc_r_interp) { gsl_interp_accel_free(acc_r_interp); acc_r_interp = NULL; }
                     if(acc_phi_interp) { gsl_interp_accel_free(acc_phi_interp); acc_phi_interp = NULL; }
-                }
+                } 
             cleanup_core_interp_arrays: 
                 if(K_all_raw) { gsl_vector_free(K_all_raw); K_all_raw = NULL; }
                 if(r_all_raw) { gsl_vector_free(r_all_raw); r_all_raw = NULL; }
                 if(phi_all_raw_temp) { gsl_vector_free(phi_all_raw_temp); phi_all_raw_temp = NULL; }
                 if(phi_unwrapped_all) { gsl_vector_free(phi_unwrapped_all); phi_unwrapped_all = NULL; }
+                 // If integration_stop_code was set to 3 by a CHECK_ macro in this block,
+                 // full_traj_output->K might be non-NULL but other vectors might be NULL.
+                 // The error_code setting later will handle this.
+            }  else { // total_raw_points < 1
+                fprintf(stderr, "Warning C%d: No raw points available for interpolation. Output K will be NULL.\n", current_call_instance);
+                if (full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+                if (full_traj_output->r) { gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;}
+                if (full_traj_output->phi) { gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;}
+                if (full_traj_output->x) { gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;}
+                if (full_traj_output->y) { gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;}
             }
         cleanup_core_interp:; 
+        } else if (integration_stop_code != 3 && integration_stop_code != 4 && integration_stop_code != 5) {
+            // This branch means: (num_segments_collected == 0 AND not the initial trivial case) OR K_final_reached_integration was negative.
+            // Implies something went wrong very early, or no valid segments.
+            fprintf(stderr, "Warning C%d: No segments collected or K_final invalid for interpolation. K_final=%.3e. Output K will be NULL.\n", current_call_instance, K_final_reached_integration);
+            if (full_traj_output && full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+            if (full_traj_output && full_traj_output->r) { gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;}
+            if (full_traj_output && full_traj_output->phi) { gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;}
+            if (full_traj_output && full_traj_output->x) { gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;}
+            if (full_traj_output && full_traj_output->y) { gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;}
         }
-        full_traj_output->crossings_y_at_x_targets = crossings_collector_ptr;
-        full_traj_output->num_x_targets = num_x_targets_val;
-        crossings_collector_ptr = NULL; 
-        if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
-        if (full_traj_output->error_code == 0 && integration_stop_code == 3) { full_traj_output->error_code = -2; }
-    }
+        
+        if (full_traj_output) { 
+            if (full_traj_output->crossings_y_at_x_targets) { 
+                for (size_t i = 0; i < full_traj_output->num_x_targets; ++i) {
+                    if(full_traj_output->crossings_y_at_x_targets[i]) {
+                        gsl_vector_free(full_traj_output->crossings_y_at_x_targets[i]);
+                    }
+                }
+                free(full_traj_output->crossings_y_at_x_targets);
+            }
+            full_traj_output->crossings_y_at_x_targets = crossings_collector_ptr;
+            full_traj_output->num_x_targets = num_x_targets_val;
+            crossings_collector_ptr = NULL; 
+            if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
+        }
+        
+        if (full_traj_output && full_traj_output->error_code == 0 && (integration_stop_code >= 3 && integration_stop_code <= 5) ) { 
+            full_traj_output->error_code = -2; 
+        }
+    } // end if (full_traj_output && integration_stop_code not critical error)
 
     if (crossings_output) {
-        crossings_output->crossings_y_at_x_targets = crossings_collector_ptr;
-        crossings_output->num_x_targets = num_x_targets_val;
-        crossings_output->error_code = (integration_stop_code == 3) ? -2 : 0;
-        crossings_collector_ptr = NULL; 
-        if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
+        if (crossings_collector_ptr) { 
+            if (crossings_output->crossings_y_at_x_targets) { 
+                for (size_t i = 0; i < crossings_output->num_x_targets; ++i) {
+                    if(crossings_output->crossings_y_at_x_targets[i]) {
+                        gsl_vector_free(crossings_output->crossings_y_at_x_targets[i]);
+                    }
+                }
+                free(crossings_output->crossings_y_at_x_targets);
+            }
+            crossings_output->crossings_y_at_x_targets = crossings_collector_ptr;
+            crossings_output->num_x_targets = num_x_targets_val;
+            crossings_collector_ptr = NULL; 
+            if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
+        }
+        crossings_output->error_code = (integration_stop_code >= 3 && integration_stop_code <=5) ? -2 : 0;
     }
 
 cleanup_core:
+    // Free resources that were allocated at the beginning of the function
     if(driver) { gsl_odeiv2_driver_free(driver); driver = NULL; }
     if(current_segment_K_temp) { gsl_vector_free(current_segment_K_temp); current_segment_K_temp = NULL; }
     if(current_segment_r_temp) { gsl_vector_free(current_segment_r_temp); current_segment_r_temp = NULL; }
     if(current_segment_phi_temp) { gsl_vector_free(current_segment_phi_temp); current_segment_phi_temp = NULL; }
+    
     if (segments_collected_list) {
-        for (size_t i = 0; i < num_segments_collected; ++i) {
+        for (size_t i = 0; i < num_segments_collected; ++i) { 
             if(segments_collected_list[i].K_pts) { gsl_vector_free(segments_collected_list[i].K_pts); }
             if(segments_collected_list[i].r_pts) { gsl_vector_free(segments_collected_list[i].r_pts); }
             if(segments_collected_list[i].phi_pts) { gsl_vector_free(segments_collected_list[i].phi_pts); }
         }
         free(segments_collected_list); segments_collected_list = NULL;
     }
+    
+    // crossings_collector_ptr should be NULL by now if transferred, otherwise needs freeing
     if (crossings_collector_ptr) { 
-        for(size_t i=0; i < num_x_targets_val; ++i) {
+        for(size_t i=0; i < num_x_targets_val; ++i) { 
             if (crossings_collector_ptr[i]) { gsl_vector_free(crossings_collector_ptr[i]); }
         }
         free(crossings_collector_ptr); crossings_collector_ptr = NULL;
     }
     if (crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
 
-    // Free any remaining GSL objects from interpolation if an error occurred mid-interpolation
-    if(K_all_raw) gsl_vector_free(K_all_raw); if(r_all_raw) gsl_vector_free(r_all_raw);
-    if(phi_all_raw_temp) gsl_vector_free(phi_all_raw_temp); if(phi_unwrapped_all) gsl_vector_free(phi_unwrapped_all);
-    if(spline_r_interp) gsl_spline_free(spline_r_interp); if(spline_phi_interp) gsl_spline_free(spline_phi_interp);
-    if(acc_r_interp) gsl_interp_accel_free(acc_r_interp); if(acc_phi_interp) gsl_interp_accel_free(acc_phi_interp);
+    // These are specifically for interpolation; should already be NULL if freed by labels
+    if(K_all_raw) {gsl_vector_free(K_all_raw); /*K_all_raw=NULL;*/} // Already nulled in its cleanup block
+    if(r_all_raw){ gsl_vector_free(r_all_raw); /*r_all_raw=NULL;*/}
+    if(phi_all_raw_temp) {gsl_vector_free(phi_all_raw_temp); /*phi_all_raw_temp=NULL;*/} 
+    if(phi_unwrapped_all) {gsl_vector_free(phi_unwrapped_all); /*phi_unwrapped_all=NULL;*/}
+    if(spline_r_interp) {gsl_spline_free(spline_r_interp); /*spline_r_interp=NULL;*/} 
+    if(spline_phi_interp) {gsl_spline_free(spline_phi_interp); /*spline_phi_interp=NULL;*/}
+    if(acc_r_interp) {gsl_interp_accel_free(acc_r_interp); /*acc_r_interp=NULL;*/} 
+    if(acc_phi_interp) {gsl_interp_accel_free(acc_phi_interp); /*acc_phi_interp=NULL;*/}
 
-
-    if (core_error_code != 0) {
+    // Propagate core_error_code (from very early allocations) if no other error code set yet
+    if (core_error_code != 0) { 
         if (full_traj_output && full_traj_output->error_code == 0) { full_traj_output->error_code = core_error_code; }
         if (crossings_output && crossings_output->error_code == 0) { crossings_output->error_code = core_error_code; }
+        // This return path indicates an allocation error before main loop, or for driver/segment list.
+        return core_error_code; 
     }
-    return (integration_stop_code == 3 || core_error_code != 0) ? -1 : 0;
+    
+    // Return -1 for integration failures (GSL error, stall, stuck loop, or alloc error during interpolation), 0 for success.
+    return (integration_stop_code >= 3 && integration_stop_code <= 5) ? -1 : 0;
 }
+// --- Public API wrappers for compute_trajectory and _crossings_only ---
+// ... (These functions remain unchanged) ...
+
 
 // --- Public API wrappers for compute_trajectory and _crossings_only ---
 PhotonTrajectory* compute_trajectory(
@@ -879,9 +1241,11 @@ ImageMapResult image_map(
 
     double x_stop_map = x_0_plane - 1.0;
 
+
     TrajectoryCrossings *crossings = compute_trajectory_crossings_only(
         x_2_observer, 0.0, 1.0, psi_calc, r_max_integration,
         x_stop_map, true, x_targets_map, DEFAULT_T_END);
+
 
     gsl_vector_free(x_targets_map);
 
@@ -891,6 +1255,8 @@ ImageMapResult image_map(
         free_trajectory_crossings(crossings);
         return im_result;
     }
+
+
 
     if (crossings->num_x_targets == 2 &&
         crossings->crossings_y_at_x_targets &&
@@ -1335,6 +1701,7 @@ int map_photons(
     double global_max_abs_y1_scan = EPSILON_GENERAL, global_max_abs_z1_scan = EPSILON_GENERAL;
     bool found_any_valid_photons = false;
 
+
     for (int ci = 0; ci < num_chunks_to_process; ++ci) {
         size_t num_pts_in_chunk;
         PhotonMapDataPoint* chunk_data = load_photon_data_chunk(photon_chunk_files[ci], &num_pts_in_chunk);
@@ -1371,6 +1738,8 @@ int map_photons(
     double source_denom_y1 = fmax(2.0 * source_map_bound_y1_extent, EPSILON_GENERAL);
     double source_denom_z1 = fmax(2.0 * source_map_bound_z1_extent, EPSILON_GENERAL);
 
+
+
     double dest_denom_y0, dest_denom_z0;
     if (using_manual_dest_bounds) {
         dest_denom_y0 = fmax(dest_map_bound_max_y - dest_map_bound_min_y, EPSILON_GENERAL);
@@ -1400,6 +1769,8 @@ int map_photons(
             double y0_f = chunk_data[i].y_window_cart_x; double z0_f = chunk_data[i].y_window_cart_y;
             double y1_f = chunk_data[i].y_image_cart_x;  double z1_f = chunk_data[i].y_image_cart_y;
 
+
+
             if (gsl_isnan(y0_f) || gsl_isnan(z0_f) || gsl_isnan(y1_f) || gsl_isnan(z1_f)) { continue; }
             if (fabs(y1_f) > source_map_bound_y1_extent + EPSILON_GENERAL || fabs(z1_f) > source_map_bound_z1_extent + EPSILON_GENERAL) { continue; }
             if (y0_f < dest_map_bound_min_y - EPSILON_GENERAL || y0_f > dest_map_bound_max_y + EPSILON_GENERAL ||
@@ -1418,6 +1789,8 @@ int map_photons(
 
             size_t dest_pixel_offset = (size_t)dest_row_idx * mapped_w + dest_col_idx;
             size_t src_pixel_offset  = (size_t)src_row_idx * orig_w * 3 + src_col_idx * 3;
+
+        
 
             sum_r_array[dest_pixel_offset] += source_image_to_use->data[src_pixel_offset + 0];
             sum_g_array[dest_pixel_offset] += source_image_to_use->data[src_pixel_offset + 1];
@@ -1451,4 +1824,216 @@ cleanup_map_photons:
     if(sum_b_array) { free(sum_b_array); }
     if(count_array_pixels) { free(count_array_pixels); }
     return final_status;
+}
+
+
+// --- Chunk I/O (Binary) ---
+int save_photon_data_chunk(const char *filename, const PhotonMapDataPoint* data, size_t num_points) {
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("save_photon_data_chunk: fopen failed");
+        return -1;
+    }
+    uint32_t num_points_u32 = (uint32_t)num_points;
+    if (num_points > UINT32_MAX) { // Check for overflow before casting
+        fprintf(stderr, "save_photon_data_chunk: num_points (%zu) exceeds uint32_t max.\n", num_points);
+        fclose(fp);
+        return -1;
+    }
+    if (fwrite(&num_points_u32, sizeof(uint32_t), 1, fp) != 1) {
+        perror("save_photon_data_chunk: fwrite num_points failed");
+        fclose(fp);
+        return -1;
+    }
+    if (num_points > 0) {
+        if (fwrite(data, sizeof(PhotonMapDataPoint), num_points, fp) != num_points) {
+            perror("save_photon_data_chunk: fwrite data points failed");
+            fclose(fp);
+            return -1;
+        }
+    }
+    if (fclose(fp) != 0) {
+        perror("save_photon_data_chunk: fclose failed");
+        return -1; // Indicate error on close
+    }
+    return 0;
+}
+
+PhotonMapDataPoint* load_photon_data_chunk(const char *filename, size_t *num_points_read) {
+    if (!num_points_read) { return NULL; } // Essential check
+    *num_points_read = 0; // Initialize
+
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("load_photon_data_chunk: fopen failed");
+        return NULL;
+    }
+    uint32_t num_points_file;
+    if (fread(&num_points_file, sizeof(uint32_t), 1, fp) != 1) {
+        perror("load_photon_data_chunk: fread num_points failed");
+        fclose(fp);
+        return NULL;
+    }
+    *num_points_read = (size_t)num_points_file;
+    if (*num_points_read == 0) {
+        fclose(fp);
+        return NULL; // No data to read, but not an error per se
+    }
+
+    PhotonMapDataPoint *data = malloc(*num_points_read * sizeof(PhotonMapDataPoint));
+    if (!data) {
+        perror("load_photon_data_chunk: malloc failed");
+        fclose(fp);
+        *num_points_read = 0;
+        return NULL;
+    }
+    if (fread(data, sizeof(PhotonMapDataPoint), *num_points_read, fp) != *num_points_read) {
+        perror("load_photon_data_chunk: fread data points failed");
+        free(data);
+        fclose(fp);
+        *num_points_read = 0;
+        return NULL;
+    }
+    if (fclose(fp) != 0) {
+        perror("load_photon_data_chunk: fclose failed");
+        // Data was read, but close failed. Decide if this is critical enough to nullify data.
+        // For now, let's assume data is okay if read was successful.
+    }
+    return data;
+}
+
+// --- PPM Image I/O (Basic P6 support) ---
+static void skip_ppm_comments_and_whitespace(FILE *fp) {
+    int ch;
+    // Skip leading whitespace
+    while ((ch = fgetc(fp)) != EOF && isspace(ch)) {
+        // Keep reading
+    }
+    // If it's a comment, skip to end of line
+    if (ch == '#') {
+        while ((ch = fgetc(fp)) != EOF && ch != '\n' && ch != '\r') {
+            // Keep reading comment
+        }
+        // After skipping comment, there might be more whitespace or another comment
+        skip_ppm_comments_and_whitespace(fp);
+    } else if (ch != EOF) {
+        // If it wasn't whitespace or '#', put it back
+        ungetc(ch, fp);
+    }
+}
+
+PPMImage* load_ppm_image(const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("load_ppm_image: fopen failed");
+        return NULL;
+    }
+
+    char magic[3];
+    if (fgets(magic, sizeof(magic), fp) == NULL || strncmp(magic, "P6", 2) != 0) {
+        fprintf(stderr, "load_ppm_image: Not a P6 PPM file or read error (magic: %s).\n", magic);
+        fclose(fp);
+        return NULL;
+    }
+
+    PPMImage *image = calloc(1, sizeof(PPMImage));
+    if (!image) {
+        perror("load_ppm_image: calloc PPMImage failed");
+        fclose(fp);
+        return NULL;
+    }
+
+    skip_ppm_comments_and_whitespace(fp);
+    if (fscanf(fp, "%d", &image->width) != 1) {
+        fprintf(stderr, "load_ppm_image: Failed to read width.\n");
+        goto read_error_ppm_load;
+    }
+    skip_ppm_comments_and_whitespace(fp);
+    if (fscanf(fp, "%d", &image->height) != 1) {
+        fprintf(stderr, "load_ppm_image: Failed to read height.\n");
+        goto read_error_ppm_load;
+    }
+    skip_ppm_comments_and_whitespace(fp);
+    int max_val;
+    if (fscanf(fp, "%d", &max_val) != 1 || max_val != 255) {
+        fprintf(stderr, "load_ppm_image: PPM max color value not 255 or read error (max_val: %d).\n", max_val);
+        goto read_error_ppm_load;
+    }
+
+    // Consume the single whitespace character (usually newline) after max_val
+    int ch_after_maxval = fgetc(fp);
+    if (!isspace(ch_after_maxval)) {
+        fprintf(stderr, "load_ppm_image: Expected whitespace after max color value, got '%c' (ASCII: %d).\n", ch_after_maxval, ch_after_maxval);
+        // ungetc(ch_after_maxval, fp); // Optional: put back if critical, but usually indicates format error
+        goto read_error_ppm_load;
+    }
+
+
+    if (image->width <= 0 || image->height <= 0) {
+        fprintf(stderr, "load_ppm_image: Invalid image dimensions %dx%d.\n", image->width, image->height);
+        goto read_error_ppm_load;
+    }
+
+    image->channels = 3;
+    size_t data_size = (size_t)image->width * image->height * image->channels;
+    image->data = malloc(data_size);
+    if (!image->data) {
+        perror("load_ppm_image: malloc for pixel data failed");
+        goto read_error_ppm_load;
+    }
+
+    if (fread(image->data, sizeof(unsigned char), data_size, fp) != data_size) {
+        perror("load_ppm_image: fread for pixel data failed or short read");
+        free(image->data); image->data = NULL; // Mark as freed
+        goto read_error_ppm_load;
+    }
+
+    if (fclose(fp) != 0) {
+        perror("load_ppm_image: fclose failed");
+        // Data read successfully, but close failed. Decide if this is critical.
+        // For now, we'll return the image.
+    }
+    return image;
+
+read_error_ppm_load:
+    if (fp) { fclose(fp); }
+    free_ppm_image(image); // Frees image and image->data if allocated
+    return NULL;
+}
+
+int save_ppm_image(const char *filename, const PPMImage *image) {
+    if (!image || !image->data || image->width <= 0 || image->height <= 0 || image->channels != 3) {
+        fprintf(stderr, "save_ppm_image: Invalid image data for saving.\n");
+        return -1;
+    }
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("save_ppm_image: fopen failed");
+        return -1;
+    }
+
+    if (fprintf(fp, "P6\n%d %d\n255\n", image->width, image->height) < 0) {
+        perror("save_ppm_image: fprintf header failed");
+        fclose(fp);
+        return -1;
+    }
+
+    size_t data_size = (size_t)image->width * image->height * image->channels;
+    if (fwrite(image->data, sizeof(unsigned char), data_size, fp) != data_size) {
+        perror("save_ppm_image: fwrite pixel data failed");
+        fclose(fp);
+        return -1;
+    }
+
+    if (fclose(fp) != 0) {
+        perror("save_ppm_image: fclose failed");
+        return -1; 
+    }
+    return 0;
+}
+
+void free_ppm_image(PPMImage *image) {
+    if (!image) { return; }
+    if(image->data) { free(image->data); }
+    free(image);
 }

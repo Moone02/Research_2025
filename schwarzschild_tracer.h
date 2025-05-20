@@ -29,7 +29,7 @@
 #define DEFAULT_CHUNK_SIZE_PHOTONS 1000000 // Number of PhotonMapDataPoint elements
 #define EPSILON_GENERAL 1e-9         // General small epsilon for comparisons
 #define EVENT_DETECTION_TOLERANCE 1e-9 // Tolerance for GSL root finder in event detection
-#define MAX_FILENAME_LEN 2048
+#define MAX_FILENAME_LEN 4096
 #define INITIAL_RAW_POINTS_CAPACITY 256 // For collecting raw trajectory points within a segment
 #define INITIAL_SEGMENTS_CAPACITY 10    // For collecting trajectory segments
 #define INITIAL_CROSSING_POINTS_CAPACITY 8 // For collecting crossing points per target
