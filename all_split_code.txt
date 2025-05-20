@@ -1,0 +1,3234 @@
+// image_mapping_utils.c
+// Top
+
+#include "schwarzschild_tracer.h" // For ImageMapResult, TrajectoryCrossings, gsl_vector, NAN, EPSILON_GENERAL, DEFAULT_T_END, M_PI
+// #include <math.h> // For sqrt, fabs, acos, fmax, fmin - already in schwarzschild_tracer.h
+// #include <gsl/gsl_vector.h> // Already in schwarzschild_tracer.h
+
+// --- Image Mapping Functions ---
+
+ImageMapResult image_map(
+    double Y, double Z, double x_0_plane, double x_1_window, double x_2_observer, double a_scale) {
+    ImageMapResult im_result = { .miss = 1, .y_window = NAN, .y_image = NAN, .error_code = 0 };
+
+    // Ensure x_2_observer > x_1_window > x_0_plane for typical reverse ray tracing setup
+    // and M=1 context as per Python reference for these mapping functions.
+    // The 'a_scale' in Python's Image_map is related to the window size for r_max calculation.
+    // Python: a_prime = (x_2 - x_0) / (x_2 - x_1) * a if (x_2 - x_1) != 0 else a
+    // Python: r_max = np.sqrt(2 * a_prime**2 + x_0**2)
+    // Python also adds a base amount to r_max: if r_max < 2*M + 100: r_max = 2*M + 100
+    // For M=1, this is r_max < 102, r_max = 102.
+
+    double M_mapping = 1.0; // Fixed Mass for these specific mapping functions as per Python.
+
+    double observer_window_diff = x_2_observer - x_1_window;
+    double a_prime;
+    if (fabs(observer_window_diff) < EPSILON_GENERAL) {
+        // Avoid division by zero if observer is at the window plane
+        a_prime = a_scale;
+    } else {
+        a_prime = ((x_2_observer - x_0_plane) / observer_window_diff) * a_scale;
+    }
+
+    double r_max_integration = sqrt(2.0 * a_prime * a_prime + x_0_plane * x_0_plane);
+    // Ensure r_max is sufficiently large, especially if geometry is compact
+    if (r_max_integration < (2.0 * M_mapping + 100.0)) {
+        r_max_integration = (2.0 * M_mapping + 100.0);
+    }
+    // Also ensure r_max is greater than observer position x_2_observer if x_2_observer is large
+    if (r_max_integration < x_2_observer + 10.0) { // Add some buffer
+         r_max_integration = x_2_observer + 10.0;
+    }
+
+
+    double rho_sq = Y * Y + Z * Z;
+    double observer_to_window_dist_sq_on_plane = observer_window_diff * observer_window_diff + rho_sq;
+
+    if (observer_to_window_dist_sq_on_plane <= EPSILON_GENERAL) { // Avoid sqrt of zero/negative or division by zero
+        im_result.error_code = 1; // Geometrically problematic
+        return im_result;
+    }
+
+    double arg_acos = sqrt(rho_sq) / sqrt(observer_to_window_dist_sq_on_plane);
+    // Clamp arg_acos to [-1, 1] to prevent domain errors with acos due to precision
+    arg_acos = fmax(-1.0, fmin(1.0, arg_acos));
+    double psi_calc = -acos(arg_acos); // Matches Python's psi calculation for Image_map
+
+    gsl_vector *x_targets_map = gsl_vector_alloc(2);
+    if (!x_targets_map) {
+        im_result.error_code = -1; // Allocation error
+        return im_result;
+    }
+    gsl_vector_set(x_targets_map, 0, x_0_plane);  // Image/Source plane
+    gsl_vector_set(x_targets_map, 1, x_1_window); // Window plane
+
+    // x_stop value should prevent trajectory from going too far "behind" the source plane
+    double x_stop_map = x_0_plane - 1.0; // Or some other reasonable offset
+
+    // Call compute_trajectory_crossings_only
+    // r_0 is observer's position, phi_0 is 0 by convention for these 2D plane calculations
+    TrajectoryCrossings *crossings = compute_trajectory_crossings_only(
+        x_2_observer, 0.0, M_mapping, psi_calc, r_max_integration,
+        x_stop_map, true, // x_stop active
+        x_targets_map, DEFAULT_T_END);
+
+    gsl_vector_free(x_targets_map); // Free after use
+
+    if (!crossings) {
+        im_result.error_code = -1; // Crossing computation failed to allocate struct
+        return im_result;
+    }
+    if (crossings->error_code != 0) {
+        im_result.error_code = crossings->error_code; // Propagate error from trajectory computation
+        free_trajectory_crossings(crossings);
+        return im_result;
+    }
+
+    // Check if we have crossings for both targets
+    // y_list[0] in Python corresponds to x_targets_map[0] (x_0_plane)
+    // y_list[1] in Python corresponds to x_targets_map[1] (x_1_window)
+    if (crossings->num_x_targets == 2 &&
+        crossings->crossings_y_at_x_targets &&
+        crossings->crossings_y_at_x_targets[0] && crossings->crossings_y_at_x_targets[0]->size > 0 &&
+        crossings->crossings_y_at_x_targets[1] && crossings->crossings_y_at_x_targets[1]->size > 0) {
+        
+        im_result.y_image = gsl_vector_get(crossings->crossings_y_at_x_targets[0], 0); // First crossing of source plane
+        im_result.y_window = gsl_vector_get(crossings->crossings_y_at_x_targets[1], 0); // First crossing of window plane
+        im_result.miss = 0; // It's a hit
+    } else {
+        im_result.miss = 1; // Miss if any target wasn't crossed or data structure is unexpected
+    }
+
+    free_trajectory_crossings(crossings);
+    return im_result;
+}
+
+ImageMapResult image_map_radial(
+    double r_rho, double x_0_plane, double x_1_window, double x_2_observer, double a_scale_factor) {
+    // This function simply calls the Cartesian version with Z=0.0 and Y=r_rho
+    return image_map(r_rho, 0.0, x_0_plane, x_1_window, x_2_observer, a_scale_factor);
+}
+
+
+#ifdef UNIT_TEST_IMAGE_MAPPING_UTILS
+// Requires trajectory_module.c to be linked for compute_trajectory_crossings_only
+// and schwarzschild_tracer.h for definitions.
+
+int main() {
+    printf("--- Unit Test for image_mapping_utils ---\n");
+    gsl_set_error_handler_off();
+
+    // Test Case 1: Radial shot (Y=0, Z=0 or r_rho=0)
+    // Expect y_window and y_image to be ~0.0
+    double x0_test1 = 3.0;
+    double x1_test1 = 10.0;
+    double x2_test1 = 20.0;
+    double a_scale_test1 = 1.0;
+    printf("Test 1: image_map_radial (r_rho=0)...\n");
+    ImageMapResult res_radial = image_map_radial(0.0, x0_test1, x1_test1, x2_test1, a_scale_test1);
+    if (res_radial.error_code == 0 && !res_radial.miss) {
+        printf("  HIT: y_window=%.6e, y_image=%.6e\n", res_radial.y_window, res_radial.y_image);
+        if (fabs(res_radial.y_window) < 1e-6 && fabs(res_radial.y_image) < 1e-6) {
+            printf("  Test 1 PASSED.\n");
+        } else {
+            printf("  Test 1 FAILED: Expected y_window and y_image near 0 for radial shot.\n");
+        }
+    } else {
+        printf("  Test 1 FAILED: Miss or error_code %d.\n", res_radial.error_code);
+    }
+
+    // Test Case 2: Cartesian shot from your main_test.c
+    double x0_test2 = -10.0;
+    double x1_test2 = 19.0;
+    double x2_test2 = 20.0;
+    double Y_test2 = 0.5;
+    double Z_test2 = 0.0; // Keep it in the plane for simplicity like radial
+    double a_scale_test2 = 1.0;
+    printf("Test 2: image_map (Y=0.5, Z=0)...\n");
+    ImageMapResult res_cart = image_map(Y_test2, Z_test2, x0_test2, x1_test2, x2_test2, a_scale_test2);
+     if (res_cart.error_code == 0 && !res_cart.miss) {
+        printf("  HIT: y_window=%.4f, y_image=%.4f\n", res_cart.y_window, res_cart.y_image);
+        // Expected values from your previous successful main_test.c output:
+        // y_window=0.5264, y_image=7.8063
+        if (fabs(res_cart.y_window - 0.5264) < 1e-3 && fabs(res_cart.y_image - 7.8063) < 1e-3) {
+             printf("  Test 2 PASSED (matches expected values).\n");
+        } else {
+             printf("  Test 2 FAILED: Values deviate from expected (y_w_exp=0.5264, y_i_exp=7.8063).\n");
+        }
+    } else {
+        printf("  Test 2 FAILED: Miss or error_code %d.\n", res_cart.error_code);
+    }
+
+    // Test Case 3: Observer inside event horizon (should ideally be caught by compute_trajectory_crossings_only or its core)
+    // compute_trajectory_crossings_only itself checks if r_0 (which is x_2_observer here) <= 2M
+    // M_mapping is 1.0 in image_map.
+    printf("Test 3: image_map (observer at x=1.0, M=1.0)...\n");
+    ImageMapResult res_inside = image_map(0.0, 0.0, -10.0, 5.0, 1.0, 1.0);
+    if (res_inside.miss == 1 && res_inside.error_code == 0) { // Expecting a miss, but no allocation error from image_map itself
+        // The underlying compute_trajectory_crossings_only should return empty crossings or an error.
+        // If it returns empty crossings, image_map sets miss=1.
+        printf("  Test 3 PASSED (correctly reported as MISS or underlying error caught by trajectory func).\n");
+    } else {
+        printf("  Test 3 FAILED: Expected miss or error for observer inside horizon (miss=%d, error_code=%d).\n", res_inside.miss, res_inside.error_code);
+    }
+
+
+    printf("--- Unit Test for image_mapping_utils Finished ---\n");
+    return 0;
+}
+#endif // UNIT_TEST_IMAGE_MAPPING_UTILS
+
+// image_mapping_utils.c
+// Bottom
+
+// main_test.c
+// Top
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h> // For NAN, fabs, ceil, round, M_PI
+#include <float.h> // For DBL_MAX
+#include "schwarzschild_tracer.h" // Your main library header
+
+// --- Helper function to create a dummy PPM image (copied from earlier version for completeness if not in a shared test_util) ---
+// If you create a test_utils.c/h, this could live there.
+PPMImage* main_test_create_dummy_ppm(int width, int height) { // Renamed to avoid conflict if linked with unit tests
+    if (width < 0 || height < 0) {
+        fprintf(stderr, "main_test_create_dummy_ppm: width and height cannot be negative.\n");
+        return NULL;
+    }
+    PPMImage* img = malloc(sizeof(PPMImage));
+    if (!img) {
+        perror("main_test_create_dummy_ppm: malloc for PPMImage struct failed");
+        return NULL;
+    }
+    img->width = width;
+    img->height = height;
+    img->channels = 3;
+    size_t data_size = (size_t)width * height * img->channels;
+
+    if (data_size == 0) {
+        img->data = NULL;
+    } else {
+        img->data = malloc(data_size);
+        if (!img->data) {
+            perror("main_test_create_dummy_ppm: malloc for image data failed");
+            free(img);
+            return NULL;
+        }
+        for (int r_idx = 0; r_idx < height; ++r_idx) {
+            for (int c_idx = 0; c_idx < width; ++c_idx) {
+                size_t idx = ((size_t)r_idx * width + c_idx) * img->channels;
+                img->data[idx + 0] = (unsigned char)((width > 1 && width - 1 != 0) ? (c_idx * 255) / (width - 1) : (c_idx * 255));
+                img->data[idx + 1] = (unsigned char)((height > 1 && height -1 != 0) ? (r_idx * 255) / (height - 1) : (r_idx * 255));
+                img->data[idx + 2] = 128;
+            }
+        }
+    }
+    return img;
+}
+
+
+int main() {
+    printf("--- Schwarzschild Tracer Integration Test Suite ---\n\n");
+    gsl_set_error_handler_off(); 
+
+    // --- Test I/O Utilities (Optional, if not covered by individual unit tests) ---
+    // For brevity, assuming test_photon_chunk_io() and test_ppm_image_io() 
+    // are run via 'make run_unit_tests' targeting their respective .c files.
+    // If you want them here too, uncomment and ensure their definitions are available or linked.
+    // test_photon_chunk_io();
+    // test_ppm_image_io();
+
+    char **radial_files = NULL;
+    int num_radial_files = 0;
+    char **cartesian_files = NULL;
+    int num_cartesian_files = 0;
+
+    // Parameters for results_... functions
+    double x0_param = -10.0;
+    double x1_param = 19.0;
+    double x2_param = 20.0;
+
+    // --- Test: results_radial (generates data for map_photons) ---
+    printf("--- Integration Test: results_radial ---\n");
+    double rr_R_max_sample = 1.0; 
+    int    rr_n_param = 100;     // Adjusted for quicker integration testing
+    size_t rr_chunk_size = DEFAULT_CHUNK_SIZE_PHOTONS / 10; 
+
+    printf("  Parameters: x0=%.2f, x1=%.2f, x2=%.2f, R_max_sample=%.2f, n=%d, chunk_size=%zu\n",
+           x0_param, x1_param, x2_param, rr_R_max_sample, rr_n_param, rr_chunk_size);
+
+    radial_files = results_radial(x0_param, x1_param, x2_param,
+                                  rr_R_max_sample, rr_n_param,
+                                  rr_chunk_size, &num_radial_files);
+    if (radial_files && num_radial_files > 0) {
+        printf("  results_radial SUCCESS. Created %d file(s). First file: %s\n", num_radial_files, radial_files[0] ? radial_files[0] : "NULL");
+    } else {
+        printf("  results_radial FAILED or produced 0 files.\n");
+    }
+    printf("\n");
+
+
+    // --- Test: map_photons with data from results_radial ---
+    printf("--- Integration Test: map_photons with results_radial data ---\n");
+    PPMImage *source_img_r = load_ppm_image("rainbow.ppm"); 
+    if (source_img_r) {
+        printf("  Loaded source image 'rainbow.ppm' (%dx%d) for map_photons radial test.\n", source_img_r->width, source_img_r->height);
+        if (radial_files && num_radial_files > 0) {
+            RGBColor bg_color_r = {0, 0, 0}; // Black background
+            
+            // Test Mode A (Full View of Source Hits)
+            double source_log_width_rA = 40.0; 
+            int target_output_w_rA = 300; 
+            const char* lensed_file_rA = "main_test_lensed_radial_ModeA.ppm"; // Distinct filename
+            printf("  map_photons Mode A (Full View): src_width=%.1f, target_out_w=%d to '%s'\n", 
+                   source_log_width_rA, target_output_w_rA, lensed_file_rA);
+            int status_rA = map_photons(NULL, source_img_r, radial_files, num_radial_files, lensed_file_rA,
+                                        source_log_width_rA, target_output_w_rA, 
+                                        NULL, // observer_window_bounds is NULL for Mode A
+                                        bg_color_r);
+            if (status_rA == 0) printf("    SUCCESS: %s created.\n", lensed_file_rA);
+            else printf("    FAILURE: map_photons Mode A status %d.\n", status_rA);
+
+            // Test Mode B (Windowed View of Source Hits)
+            double source_log_width_rB = 25.0; 
+            int target_output_w_rB = 200;
+            double obs_window_rB[4] = {-0.5, 0.5, -0.25, 0.25}; // y0min, y0max, z0min, z0max
+            const char* lensed_file_rB = "main_test_lensed_radial_ModeB.ppm"; // Distinct filename
+            printf("  map_photons Mode B (Windowed): src_width=%.1f, target_out_w=%d, window=[%.2f,%.2f,%.2f,%.2f] to '%s'\n", 
+                   source_log_width_rB, target_output_w_rB, obs_window_rB[0], obs_window_rB[1], obs_window_rB[2], obs_window_rB[3], lensed_file_rB);
+            int status_rB = map_photons(NULL, source_img_r, radial_files, num_radial_files, lensed_file_rB,
+                                        source_log_width_rB, target_output_w_rB, 
+                                        obs_window_rB, 
+                                        bg_color_r);
+            if (status_rB == 0) printf("    SUCCESS: %s created.\n", lensed_file_rB);
+            else printf("    FAILURE: map_photons Mode B status %d.\n", status_rB);
+
+        } else { printf("  Skipping map_photons with radial_files as none were generated.\n"); }
+        free_ppm_image(source_img_r);
+        source_img_r = NULL;
+    } else { printf("  Failed to load rainbow.ppm for map_photons radial test.\n");}
+    
+    if (radial_files) { 
+        free_string_array(radial_files, num_radial_files); 
+        radial_files = NULL; 
+        num_radial_files = 0;
+    }
+    printf("\n");
+
+
+    // --- Test: results_cartesian (generates data for map_photons) ---
+    printf("--- Integration Test: results_cartesian ---\n");
+    double rc_a_param = 1.0; 
+    int    rc_n_param = 200;  // Using your increased value
+    size_t rc_chunk_size = DEFAULT_CHUNK_SIZE_PHOTONS; 
+
+    printf("  Parameters: x0=%.2f, x1=%.2f, x2=%.2f, a=%.2f, n=%d, chunk_size=%zu\n",
+           x0_param, x1_param, x2_param, rc_a_param, rc_n_param, rc_chunk_size);
+
+    cartesian_files = results_cartesian(x0_param, x1_param, x2_param,
+                                       rc_a_param, rc_n_param,
+                                       rc_chunk_size, &num_cartesian_files);
+    if (cartesian_files && num_cartesian_files > 0) {
+        printf("  results_cartesian SUCCESS. Created %d file(s). First file: %s\n", num_cartesian_files, cartesian_files[0] ? cartesian_files[0] : "NULL");
+    } else {
+        printf("  results_cartesian FAILED or produced 0 files.\n");
+    }
+    printf("\n");
+
+    // --- Test: map_photons with data from results_cartesian ---
+    printf("--- Integration Test: map_photons with results_cartesian data ---\n");
+    PPMImage *source_img_c = load_ppm_image("rainbow.ppm");
+    if (source_img_c) {
+        printf("  Loaded source image 'rainbow.ppm' (%dx%d) for map_photons cartesian test.\n", source_img_c->width, source_img_c->height);
+        if (cartesian_files && num_cartesian_files > 0) {
+            RGBColor bg_color_c = {0, 0, 0}; // Black background
+            
+            // Test Mode B (Windowed View) with Cartesian data
+            double source_log_width_cB = 30.0; 
+            int target_output_w_cB = 280;
+            double obs_window_cB[4] = {-1.0, 1.0, -1.0, 1.0}; // Window from your last successful run's Mode 1
+            const char* lensed_file_cB = "main_test_lensed_cartesian_ModeB.ppm"; // Distinct filename
+            printf("  map_photons Mode B (Windowed): src_width=%.1f, target_out_w=%d, window=[%.1f,%.1f,%.1f,%.1f] to '%s'\n", 
+                   source_log_width_cB, target_output_w_cB, obs_window_cB[0], obs_window_cB[1], obs_window_cB[2], obs_window_cB[3], lensed_file_cB);
+            int status_cB = map_photons(NULL, source_img_c, cartesian_files, num_cartesian_files, lensed_file_cB,
+                                        source_log_width_cB, target_output_w_cB, 
+                                        obs_window_cB, 
+                                        bg_color_c);
+            if (status_cB == 0) printf("    SUCCESS: %s created.\n", lensed_file_cB);
+            else printf("    FAILURE: map_photons Mode B status %d.\n", status_cB);
+
+        } else { printf("  Skipping map_photons with cartesian_files as none were generated.\n"); }
+        free_ppm_image(source_img_c);
+        source_img_c = NULL;
+    } else { printf("  Failed to load rainbow.ppm for map_photons cartesian test.\n");}
+    
+    if (cartesian_files) { 
+        free_string_array(cartesian_files, num_cartesian_files); 
+        cartesian_files = NULL;
+        num_cartesian_files = 0;
+    }
+    printf("\n");
+
+    printf("--- Integration Test Suite Finished ---\n");
+    return 0;
+}
+
+// End of main_test.c
+// Bottom
+
+## Top
+## Makefile
+# Compiler and Linker
+CC = gcc
+# CFLAGS: Compiler flags
+# -Wall -Wextra: Enable many useful warnings
+# -std=c11: Use the C11 standard
+# -g: Include debugging information
+# -O2: Optimization level (optional, can remove for easier debugging initially)
+CFLAGS = -Wall -Wextra -std=c11 -g -O2 
+# LDFLAGS: Linker flags
+# -lm: Link math library
+# -lgsl -lgslcblas: Link GSL and GSL's CBLAS implementation
+LDFLAGS = -lm -lgsl -lgslcblas
+
+# --- Adjust GSL paths if not in standard locations ---
+# Example for Homebrew on ARM Mac (Apple Silicon):
+# GSL_INCLUDE_DIR = /opt/homebrew/opt/gsl/include
+# GSL_LIB_DIR = /opt/homebrew/opt/gsl/lib
+# Example for Homebrew on Intel Mac:
+# GSL_INCLUDE_DIR = /usr/local/opt/gsl/include
+# GSL_LIB_DIR = /usr/local/opt/gsl/lib
+# If GSL_INCLUDE_DIR and GSL_LIB_DIR are set, uncomment the following:
+# CFLAGS += -I$(GSL_INCLUDE_DIR)
+# LDFLAGS += -L$(GSL_LIB_DIR)
+# --- End GSL Path Adjustment ---
+
+# Header file (dependency for most .c files)
+HEADER = schwarzschild_tracer.h
+
+# Source files for the library part (excluding main_test.c)
+SRCS_LIB = \
+    trajectory_module.c \
+    image_mapping_utils.c \
+    results_generation.c \
+    photon_rendering.c \
+    photon_chunk_io.c \
+    ppm_image_io.c
+
+# Object files for the library part
+OBJS_LIB = $(SRCS_LIB:.c=.o)
+
+# Main test program
+MAIN_TEST_EXEC = schwarzschild_test
+MAIN_TEST_SRC = main_test.c
+MAIN_TEST_OBJ = $(MAIN_TEST_SRC:.c=.o)
+
+# Default target: build the main test executable
+all: $(MAIN_TEST_EXEC)
+
+# Rule to link the main test executable
+$(MAIN_TEST_EXEC): $(OBJS_LIB) $(MAIN_TEST_OBJ)
+	@echo "Linking $(MAIN_TEST_EXEC)..."
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+	@echo "$(MAIN_TEST_EXEC) built successfully."
+
+# Generic rule to compile .c files into .o object files
+# Depends on the source file itself and the main header
+%.o: %.c $(HEADER)
+	@echo "Compiling $<..."
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# --- Unit Test Targets ---
+# For each .c file that has an embedded main() for unit testing,
+# create a target. The executable will be named "test_MODULENAME".
+# The -DUNIT_TEST_MODULENAME flag activates the embedded main().
+
+# Unit test for trajectory_module.c
+UT_TRAJ_EXEC = test_trajectory_module
+UT_TRAJ_SRC = trajectory_module.c
+$(UT_TRAJ_EXEC): $(UT_TRAJ_SRC) $(HEADER)
+	@echo "Building unit test $(UT_TRAJ_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_TRAJECTORY_MODULE $(UT_TRAJ_SRC) -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_TRAJ_EXEC)..."
+	./$(UT_TRAJ_EXEC)
+
+# Unit test for image_mapping_utils.c
+# This unit test depends on trajectory_module.o because image_map calls compute_trajectory_crossings_only
+UT_IMGMAP_EXEC = test_image_mapping_utils
+UT_IMGMAP_SRC = image_mapping_utils.c
+$(UT_IMGMAP_EXEC): $(UT_IMGMAP_SRC) trajectory_module.o $(HEADER)
+	@echo "Building unit test $(UT_IMGMAP_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_IMAGE_MAPPING_UTILS $(UT_IMGMAP_SRC) trajectory_module.o -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_IMGMAP_EXEC)..."
+	./$(UT_IMGMAP_EXEC)
+
+# Unit test for results_generation.c
+# Depends on image_mapping_utils.o, trajectory_module.o, photon_chunk_io.o
+UT_RESGEN_EXEC = test_results_generation
+UT_RESGEN_SRC = results_generation.c
+UT_RESGEN_DEPS_OBJS = image_mapping_utils.o trajectory_module.o photon_chunk_io.o 
+$(UT_RESGEN_EXEC): $(UT_RESGEN_SRC) $(UT_RESGEN_DEPS_OBJS) $(HEADER)
+	@echo "Building unit test $(UT_RESGEN_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_RESULTS_GENERATION $(UT_RESGEN_SRC) $(UT_RESGEN_DEPS_OBJS) -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_RESGEN_EXEC)..."
+	./$(UT_RESGEN_EXEC)
+
+# Unit test for photon_rendering.c (map_photons)
+# Depends on ppm_image_io.o, photon_chunk_io.o
+UT_PHOTREND_EXEC = test_photon_rendering
+UT_PHOTREND_SRC = photon_rendering.c
+UT_PHOTREND_DEPS_OBJS = ppm_image_io.o photon_chunk_io.o
+$(UT_PHOTREND_EXEC): $(UT_PHOTREND_SRC) $(UT_PHOTREND_DEPS_OBJS) $(HEADER)
+	@echo "Building unit test $(UT_PHOTREND_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_PHOTON_RENDERING $(UT_PHOTREND_SRC) $(UT_PHOTREND_DEPS_OBJS) -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_PHOTREND_EXEC)..."
+	./$(UT_PHOTREND_EXEC)
+
+# Unit test for photon_chunk_io.c
+UT_CHUNKIO_EXEC = test_photon_chunk_io
+UT_CHUNKIO_SRC = photon_chunk_io.c
+$(UT_CHUNKIO_EXEC): $(UT_CHUNKIO_SRC) $(HEADER)
+	@echo "Building unit test $(UT_CHUNKIO_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_CHUNK_IO $(UT_CHUNKIO_SRC) -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_CHUNKIO_EXEC)..."
+	./$(UT_CHUNKIO_EXEC)
+
+# Unit test for ppm_image_io.c
+UT_PPMIO_EXEC = test_ppm_image_io
+UT_PPMIO_SRC = ppm_image_io.c
+$(UT_PPMIO_EXEC): $(UT_PPMIO_SRC) $(HEADER)
+	@echo "Building unit test $(UT_PPMIO_EXEC)..."
+	$(CC) $(CFLAGS) -DUNIT_TEST_PPM_IO $(UT_PPMIO_SRC) -o $@ $(LDFLAGS)
+	@echo "Running unit test $(UT_PPMIO_EXEC)..."
+	./$(UT_PPMIO_EXEC)
+
+# Target to run all defined unit tests
+run_unit_tests: $(UT_TRAJ_EXEC) $(UT_IMGMAP_EXEC) $(UT_RESGEN_EXEC) $(UT_PHOTREND_EXEC) $(UT_CHUNKIO_EXEC) $(UT_PPMIO_EXEC)
+	@echo "\nAll specified unit tests have been run."
+
+# Clean target
+clean:
+	@echo "Cleaning up..."
+	rm -f $(OBJS_LIB) $(MAIN_TEST_OBJ) $(MAIN_TEST_EXEC) 
+	rm -f $(UT_TRAJ_EXEC) $(UT_IMGMAP_EXEC) $(UT_RESGEN_EXEC) $(UT_PHOTREND_EXEC) $(UT_CHUNKIO_EXEC) $(UT_PPMIO_EXEC)
+	rm -f *.o # Catch any other .o files
+	rm -f test_*.ppm test_*.bin # Clean up test output files
+	rm -f ResCart_*.bin ResRad_*.bin LightRingSeg0thLrg_*.bin # Clean up results_... output files
+	rm -f test_lensed_*.ppm # Clean up map_photons output from main_test
+	@echo "Cleanup complete."
+
+# Phony targets are not files
+.PHONY: all clean run_unit_tests $(UT_TRAJ_EXEC) $(UT_IMGMAP_EXEC) $(UT_RESGEN_EXEC) $(UT_PHOTREND_EXEC) $(UT_CHUNKIO_EXEC) $(UT_PPMIO_EXEC)
+
+## END of Makefile
+## Bottom
+
+// photon_chunk_io.c
+// Top
+
+#define _POSIX_C_SOURCE 200809L
+#include "schwarzschild_tracer.h" // For PhotonMapDataPoint, and common includes like stdio, stdlib, stdint
+// #include <stdio.h>   // Already in schwarzschild_tracer.h
+// #include <stdlib.h>  // Already in schwarzschild_tracer.h
+// #include <stdint.h>  // Already in schwarzschild_tracer.h
+
+// --- Chunk I/O (Binary) ---
+int save_photon_data_chunk(const char *filename, const PhotonMapDataPoint* data, size_t num_points) {
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("save_photon_data_chunk: fopen failed");
+        return -1;
+    }
+    // Check for num_points overflow before casting to uint32_t
+    if (num_points > UINT32_MAX) {
+        fprintf(stderr, "save_photon_data_chunk: num_points (%zu) exceeds uint32_t max.\n", num_points);
+        fclose(fp);
+        return -2; // Indicate different error for overflow
+    }
+    uint32_t num_points_u32 = (uint32_t)num_points;
+
+    if (fwrite(&num_points_u32, sizeof(uint32_t), 1, fp) != 1) {
+        perror("save_photon_data_chunk: fwrite num_points failed");
+        fclose(fp);
+        return -1;
+    }
+    if (num_points > 0) { // Only write data if there are points
+        if (!data) { // Safety check if num_points > 0 but data is NULL
+            fprintf(stderr, "save_photon_data_chunk: num_points > 0 but data is NULL.\n");
+            fclose(fp);
+            return -3; // Indicate invalid argument
+        }
+        if (fwrite(data, sizeof(PhotonMapDataPoint), num_points, fp) != num_points) {
+            perror("save_photon_data_chunk: fwrite data points failed");
+            fclose(fp);
+            return -1;
+        }
+    }
+    if (fclose(fp) != 0) {
+        perror("save_photon_data_chunk: fclose failed");
+        return -1; 
+    }
+    return 0;
+}
+
+PhotonMapDataPoint* load_photon_data_chunk(const char *filename, size_t *num_points_read) {
+    if (!num_points_read) { 
+        fprintf(stderr, "load_photon_data_chunk: num_points_read pointer is NULL.\n");
+        return NULL; 
+    }
+    *num_points_read = 0; 
+
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("load_photon_data_chunk: fopen failed");
+        return NULL;
+    }
+    uint32_t num_points_file;
+    if (fread(&num_points_file, sizeof(uint32_t), 1, fp) != 1) {
+        // Could be EOF if file is empty or < 4 bytes, not necessarily a full perror.
+        if (feof(fp)) {
+             fprintf(stderr, "load_photon_data_chunk: Premature EOF reading num_points from %s.\n", filename);
+        } else {
+            perror("load_photon_data_chunk: fread num_points failed");
+        }
+        fclose(fp);
+        return NULL;
+    }
+    *num_points_read = (size_t)num_points_file;
+    if (*num_points_read == 0) {
+        fclose(fp);
+        return NULL; 
+    }
+
+    PhotonMapDataPoint *data = malloc(*num_points_read * sizeof(PhotonMapDataPoint));
+    if (!data) {
+        perror("load_photon_data_chunk: malloc failed");
+        fclose(fp);
+        *num_points_read = 0; // Reset on failure
+        return NULL;
+    }
+    if (fread(data, sizeof(PhotonMapDataPoint), *num_points_read, fp) != *num_points_read) {
+        perror("load_photon_data_chunk: fread data points failed or short read");
+        free(data);
+        fclose(fp);
+        *num_points_read = 0; // Reset on failure
+        return NULL;
+    }
+    if (fclose(fp) != 0) {
+        perror("load_photon_data_chunk: fclose failed");
+    }
+    return data;
+}
+
+
+#ifdef UNIT_TEST_CHUNK_IO
+#include <math.h> // For fabs in comparison helper
+
+// Helper to compare PhotonMapDataPoint for testing
+static int test_compare_photons(const PhotonMapDataPoint* p1, const PhotonMapDataPoint* p2, double tol) {
+    return (fabs(p1->y_window_cart_x - p2->y_window_cart_x) < tol &&
+            fabs(p1->y_window_cart_y - p2->y_window_cart_y) < tol &&
+            fabs(p1->y_image_cart_x - p2->y_image_cart_x) < tol &&
+            fabs(p1->y_image_cart_y - p2->y_image_cart_y) < tol);
+}
+
+int main() {
+    printf("--- Unit Test for photon_chunk_io ---\n");
+    const char* test_file = "test_chunk_io_temp.bin";
+    PhotonMapDataPoint *loaded_data;
+    size_t num_loaded;
+
+    // Test 1: Save and load 3 points
+    PhotonMapDataPoint original_data[3] = {
+        {1.0, 2.0, 3.0, 4.0},
+        {-1.0, -2.0, -3.0, -4.0},
+        {0.5, -0.5, 10.5, -10.5}
+    };
+    printf("Test 1: Saving 3 points...\n");
+    if (save_photon_data_chunk(test_file, original_data, 3) != 0) {
+        printf("Test 1 FAILED: save_photon_data_chunk\n"); return 1;
+    }
+    loaded_data = load_photon_data_chunk(test_file, &num_loaded);
+    if (!loaded_data || num_loaded != 3) {
+        printf("Test 1 FAILED: load_photon_data_chunk (count %zu, ptr %p)\n", num_loaded, (void*)loaded_data);
+        if(loaded_data) free(loaded_data); remove(test_file); return 1;
+    }
+    int match = 1;
+    for(size_t i=0; i<3; ++i) if(!test_compare_photons(&original_data[i], &loaded_data[i], 1e-9)) match=0;
+    if(match) printf("Test 1 PASSED\n"); else printf("Test 1 FAILED: data mismatch\n");
+    free(loaded_data);
+    remove(test_file);
+
+    // Test 2: Save and load 0 points
+    printf("Test 2: Saving 0 points...\n");
+    if (save_photon_data_chunk(test_file, NULL, 0) != 0) { // Pass NULL for data when 0 points
+        printf("Test 2 FAILED: save_photon_data_chunk (0 points)\n"); return 1;
+    }
+    loaded_data = load_photon_data_chunk(test_file, &num_loaded);
+    if (loaded_data == NULL && num_loaded == 0) {
+        printf("Test 2 PASSED (0 points handling)\n");
+    } else {
+        printf("Test 2 FAILED: load_photon_data_chunk (0 points) (count %zu, ptr %p)\n", num_loaded, (void*)loaded_data);
+        if(loaded_data) free(loaded_data);
+    }
+    remove(test_file);
+    
+    // Test 3: Attempt to load non-existent file
+    printf("Test 3: Loading non-existent file...\n");
+    loaded_data = load_photon_data_chunk("non_existent_chunk.bin", &num_loaded);
+    if (loaded_data == NULL && num_loaded == 0) {
+         printf("Test 3 PASSED (non-existent file handling)\n");
+    } else {
+         printf("Test 3 FAILED: load non-existent file did not return NULL/0 (count %zu, ptr %p)\n", num_loaded, (void*)loaded_data);
+        if(loaded_data) free(loaded_data);
+    }
+
+
+    printf("--- Unit Test for photon_chunk_io Finished ---\n");
+    return 0;
+}
+#endif // UNIT_TEST_CHUNK_IO
+
+// photon_chunk_io.c
+// Bottom
+
+// photon_rendering.c
+// Top
+
+#define _POSIX_C_SOURCE 200809L 
+#include "schwarzschild_tracer.h"
+// Includes like stdio.h, stdlib.h, string.h, math.h, float.h, gsl/gsl_sys.h
+// should be covered by schwarzschild_tracer.h
+
+// Note: load_ppm_image, save_ppm_image, free_ppm_image,
+// load_photon_data_chunk are declared in schwarzschild_tracer.h
+// and will be defined in their respective .c files (ppm_image_io.c, photon_chunk_io.c).
+
+int map_photons(
+    const char *image_source_path, PPMImage *image_source_data_param,
+    char **photon_chunk_files, int num_chunk_files_param,
+    const char *save_path,
+    double source_logical_width_input,
+    int target_output_pixel_width,
+    const double *observer_window_bounds, // If NULL, Mode A, else Mode B
+    RGBColor default_color_param) {
+
+    int mapped_h = 1, mapped_w = 1;
+    double dest_map_bound_min_y = 0.0, dest_map_bound_max_y = 0.0;
+    double dest_map_bound_min_z = 0.0, dest_map_bound_max_z = 0.0;
+
+    PPMImage *source_image_loaded = NULL;
+    const PPMImage *source_image_to_use = NULL;
+    unsigned char *mapped_image_pixels = NULL;
+    double *sum_r_array = NULL, *sum_g_array = NULL, *sum_b_array = NULL;
+    int64_t *count_array_pixels = NULL;
+    int final_status = -1;
+
+    // --- 1. Validate Inputs & Load Source Image ---
+    if (target_output_pixel_width <= 0) {
+        fprintf(stderr, "map_photons: target_output_pixel_width must be positive.\n");
+        goto cleanup_map_photons_early;
+    }
+    if (source_logical_width_input <= EPSILON_GENERAL) {
+        fprintf(stderr, "map_photons: source_logical_width_input must be positive.\n");
+        goto cleanup_map_photons_early;
+    }
+
+    if (image_source_data_param) {
+        source_image_to_use = image_source_data_param;
+    } else if (image_source_path) {
+        source_image_loaded = load_ppm_image(image_source_path);
+        if (!source_image_loaded) {
+            fprintf(stderr, "map_photons: Failed to load source image from '%s'.\n", image_source_path);
+            goto cleanup_map_photons_early;
+        }
+        source_image_to_use = source_image_loaded;
+    } else {
+        fprintf(stderr, "map_photons: No source image provided (path or data).\n"); goto cleanup_map_photons_early;
+    }
+    if (!source_image_to_use || source_image_to_use->width <= 0 || source_image_to_use->height <= 0 || source_image_to_use->channels != 3) {
+        fprintf(stderr, "map_photons: Invalid source image properties.\n"); goto cleanup_map_photons_early;
+    }
+    int orig_h = source_image_to_use->height; int orig_w = source_image_to_use->width;
+    double source_pixel_aspect = (orig_h > 0) ? ((double)orig_w / orig_h) : 1.0;
+    printf("map_photons: Source image '%s' loaded (%dx%d, aspect: %.3f).\n",
+           image_source_path ? image_source_path : "from data", orig_w, orig_h, source_pixel_aspect);
+
+    // --- Determine num_chunks_to_process EARLY ---
+    int num_chunks_to_process = 0;
+    if (photon_chunk_files) {
+        if (num_chunk_files_param >= 0) {
+            num_chunks_to_process = num_chunk_files_param;
+        } else {
+            for (num_chunks_to_process = 0; photon_chunk_files[num_chunks_to_process] != NULL; ++num_chunks_to_process);
+        }
+    }
+    printf("map_photons: Number of photon chunk files to process: %d\n", num_chunks_to_process);
+
+    // --- 2. Define Source Logical Area to Sample From (common to both modes) ---
+    double source_logical_height_calculated;
+    if (source_pixel_aspect > EPSILON_GENERAL) {
+        source_logical_height_calculated = source_logical_width_input / source_pixel_aspect;
+    } else {
+        fprintf(stderr, "map_photons: Warning - source image aspect ratio invalid. Setting source logical height equal to width.\n");
+        source_logical_height_calculated = source_logical_width_input;
+    }
+    source_logical_height_calculated = fmax(source_logical_height_calculated, EPSILON_GENERAL);
+
+    double source_map_bound_y1_extent = source_logical_width_input / 2.0; 
+    double source_map_bound_z1_extent = source_logical_height_calculated / 2.0;
+    double source_denom_y1 = fmax(source_logical_width_input, EPSILON_GENERAL);    
+    double source_denom_z1 = fmax(source_logical_height_calculated, EPSILON_GENERAL); 
+    printf("Source logical sampling area: y1 in [%.3f, %.3f], z1 in [%.3f, %.3f]\n",
+           -source_map_bound_y1_extent, source_map_bound_y1_extent,
+           -source_map_bound_z1_extent, source_map_bound_z1_extent);
+
+    // --- 3. Determine Mode and Output Pixel/Logical Dimensions ---
+    mapped_w = target_output_pixel_width; 
+
+    if (observer_window_bounds == NULL) { // MODE A: "Full View of Source Hits"
+        printf("Operating in Mode A: Full View of Source Hits.\n");
+        printf("  Z-axis rendering: Logical MIN_z maps to image top, logical MAX_z to image bottom.\n");
+
+        if (source_pixel_aspect > EPSILON_GENERAL) {
+            mapped_h = (int)round((double)mapped_w / source_pixel_aspect);
+        } else {
+            mapped_h = mapped_w; 
+        }
+        if (mapped_h <= 0) mapped_h = 1;
+        printf("  Output pixel dimensions (WxH): %d x %d (matches source aspect).\n", mapped_w, mapped_h);
+
+        double min_y0_scan = DBL_MAX, max_y0_scan = -DBL_MAX;
+        double min_z0_scan = DBL_MAX, max_z0_scan = -DBL_MAX;
+        bool found_photons_for_mode_a = false;
+
+        if (num_chunks_to_process > 0) {
+            printf("  Scanning photon chunks for Mode A destination bounds...\n");
+            for (int ci_scan = 0; ci_scan < num_chunks_to_process; ++ci_scan) {
+                size_t num_pts_scan;
+                PhotonMapDataPoint* chunk_scan = load_photon_data_chunk(photon_chunk_files[ci_scan], &num_pts_scan);
+                if (chunk_scan && num_pts_scan > 0) {
+                    for (size_t k = 0; k < num_pts_scan; ++k) {
+                        if (fabs(chunk_scan[k].y_image_cart_x) > source_map_bound_y1_extent + EPSILON_GENERAL ||
+                            fabs(chunk_scan[k].y_image_cart_y) > source_map_bound_z1_extent + EPSILON_GENERAL) {
+                            continue; 
+                        }
+                        if (gsl_isnan(chunk_scan[k].y_window_cart_x) || gsl_isnan(chunk_scan[k].y_window_cart_y)) continue;
+
+                        found_photons_for_mode_a = true;
+                        if (chunk_scan[k].y_window_cart_x < min_y0_scan) min_y0_scan = chunk_scan[k].y_window_cart_x;
+                        if (chunk_scan[k].y_window_cart_x > max_y0_scan) max_y0_scan = chunk_scan[k].y_window_cart_x;
+                        if (chunk_scan[k].y_window_cart_y < min_z0_scan) min_z0_scan = chunk_scan[k].y_window_cart_y;
+                        if (chunk_scan[k].y_window_cart_y > max_z0_scan) max_z0_scan = chunk_scan[k].y_window_cart_y;
+                    }
+                }
+                free(chunk_scan);
+            }
+        }
+
+        if (!found_photons_for_mode_a) {
+            printf("  Warning: No photons found hitting the source area for Mode A. Output will be background color.\n");
+            dest_map_bound_min_y = -1.0; dest_map_bound_max_y = 1.0;
+            dest_map_bound_min_z = -1.0; dest_map_bound_max_z = 1.0;
+        } else {
+            double scanned_logical_width = fmax(max_y0_scan - min_y0_scan, EPSILON_GENERAL);
+            double scanned_logical_height = fmax(max_z0_scan - min_z0_scan, EPSILON_GENERAL);
+            double scanned_aspect = (scanned_logical_height > EPSILON_GENERAL) ? (scanned_logical_width / scanned_logical_height) : 1.0;
+            printf("  Mode A: Scanned photon window extents: y0=[%.3f, %.3f], z0=[%.3f, %.3f] (Aspect: %.3f)\n",
+                   min_y0_scan, max_y0_scan, min_z0_scan, max_z0_scan, scanned_aspect);
+
+            if (scanned_aspect > source_pixel_aspect) { 
+                double scanned_z_center = (min_z0_scan + max_z0_scan) / 2.0;
+                double new_logical_height = scanned_logical_width / source_pixel_aspect;
+                dest_map_bound_min_y = min_y0_scan;
+                dest_map_bound_max_y = max_y0_scan;
+                dest_map_bound_min_z = scanned_z_center - new_logical_height / 2.0;
+                dest_map_bound_max_z = scanned_z_center + new_logical_height / 2.0;
+            } else { 
+                double scanned_y_center = (min_y0_scan + max_y0_scan) / 2.0;
+                double new_logical_width = scanned_logical_height * source_pixel_aspect;
+                dest_map_bound_min_z = min_z0_scan;
+                dest_map_bound_max_z = max_z0_scan;
+                dest_map_bound_min_y = scanned_y_center - new_logical_width / 2.0;
+                dest_map_bound_max_y = scanned_y_center + new_logical_width / 2.0;
+            }
+        }
+        printf("  Mode A: Final logical window to render: y0=[%.3f, %.3f], z0=[%.3f, %.3f] (Aspect: %.3f)\n",
+               dest_map_bound_min_y, dest_map_bound_max_y, dest_map_bound_min_z, dest_map_bound_max_z,
+               ( (dest_map_bound_max_z - dest_map_bound_min_z) > EPSILON_GENERAL ? 
+                 (dest_map_bound_max_y - dest_map_bound_min_y) / (dest_map_bound_max_z - dest_map_bound_min_z) : 0.0 ) );
+
+    } else { // MODE B: "Windowed View of Source Hits"
+        printf("Operating in Mode B: Windowed View of Source Hits.\n");
+        printf("  Z-axis rendering: Logical MIN_z maps to image top, logical MAX_z to image bottom.\n");
+
+        dest_map_bound_min_y = observer_window_bounds[0];
+        dest_map_bound_max_y = observer_window_bounds[1];
+        dest_map_bound_min_z = observer_window_bounds[2];
+        dest_map_bound_max_z = observer_window_bounds[3];
+
+        if (dest_map_bound_min_y >= dest_map_bound_max_y || dest_map_bound_min_z >= dest_map_bound_max_z) {
+            fprintf(stderr, "map_photons: Invalid observer_window_bounds (min >= max).\n");
+            goto cleanup_map_photons_early; 
+        }
+
+        double window_logical_width = dest_map_bound_max_y - dest_map_bound_min_y;
+        double window_logical_height = dest_map_bound_max_z - dest_map_bound_min_z;
+        double observer_window_aspect = (window_logical_height > EPSILON_GENERAL) ? (window_logical_width / window_logical_height) : 1.0;
+
+        if (observer_window_aspect > EPSILON_GENERAL) {
+            mapped_h = (int)round((double)mapped_w / observer_window_aspect);
+        } else {
+            mapped_h = mapped_w; 
+        }
+        if (mapped_h <= 0) mapped_h = 1;
+        printf("  Output pixel dimensions (WxH): %d x %d (matches observer window aspect %.3f).\n", mapped_w, mapped_h, observer_window_aspect);
+        printf("  User-defined observer window (logical): y0 in [%.3f, %.3f], z0 in [%.3f, %.3f]\n",
+               dest_map_bound_min_y, dest_map_bound_max_y, dest_map_bound_min_z, dest_map_bound_max_z);
+    }
+
+    // --- 4. Allocate Buffers & Handle Empty Chunk List ---
+    size_t num_output_pixels = (size_t)mapped_h * mapped_w;
+    mapped_image_pixels = malloc(num_output_pixels * 3 * sizeof(unsigned char));
+    sum_r_array = calloc(num_output_pixels, sizeof(double));
+    sum_g_array = calloc(num_output_pixels, sizeof(double));
+    sum_b_array = calloc(num_output_pixels, sizeof(double));
+    count_array_pixels = calloc(num_output_pixels, sizeof(int64_t));
+    if (!mapped_image_pixels || !sum_r_array || !sum_g_array || !sum_b_array || !count_array_pixels) {
+        fprintf(stderr, "map_photons: Failed to allocate image buffers.\n"); goto cleanup_map_photons;
+    }
+    for (size_t i = 0; i < num_output_pixels; ++i) {
+        mapped_image_pixels[i*3 + 0] = default_color_param.r;
+        mapped_image_pixels[i*3 + 1] = default_color_param.g;
+        mapped_image_pixels[i*3 + 2] = default_color_param.b;
+    }
+
+    if (num_chunks_to_process == 0 && save_path && strlen(save_path) > 0) {
+        printf("map_photons: No photon chunk files provided. Saving default background image.\n");
+        PPMImage temp_out_img = {mapped_image_pixels, mapped_w, mapped_h, 3};
+        if (save_ppm_image(save_path, &temp_out_img) == 0) final_status = 0;
+        goto cleanup_map_photons; 
+    }
+    
+    double dest_denom_y0 = fmax(dest_map_bound_max_y - dest_map_bound_min_y, EPSILON_GENERAL);
+    double dest_denom_z0 = fmax(dest_map_bound_max_z - dest_map_bound_min_z, EPSILON_GENERAL);
+
+    // --- 5. Loop Through Chunks for Actual Pixel Processing & Accumulation ---
+    printf("Processing photon data for rendering...\n");
+    for (int ci = 0; ci < num_chunks_to_process; ++ci) {
+        if ((ci + 1) % 10 == 0 || ci == 0 || ci == num_chunks_to_process - 1 || num_chunks_to_process < 10) {
+             printf("\r  Processing chunk %d/%d: %s...", ci + 1, num_chunks_to_process, photon_chunk_files[ci]); fflush(stdout);
+        }
+        size_t num_pts_in_chunk;
+        PhotonMapDataPoint* chunk_data = load_photon_data_chunk(photon_chunk_files[ci], &num_pts_in_chunk);
+        if (!chunk_data || num_pts_in_chunk == 0) { free(chunk_data); continue; }
+
+        for (size_t k_photon = 0; k_photon < num_pts_in_chunk; ++k_photon) {
+            double y0_f = chunk_data[k_photon].y_window_cart_x; double z0_f = chunk_data[k_photon].y_window_cart_y;
+            double y1_f = chunk_data[k_photon].y_image_cart_x;  double z1_f = chunk_data[k_photon].y_image_cart_y;
+
+            if (gsl_isnan(y0_f) || gsl_isnan(z0_f) || gsl_isnan(y1_f) || gsl_isnan(z1_f)) { continue; }
+
+            if (fabs(y1_f) > source_map_bound_y1_extent + EPSILON_GENERAL ||
+                fabs(z1_f) > source_map_bound_z1_extent + EPSILON_GENERAL) {
+                continue;
+            }
+            if (y0_f < dest_map_bound_min_y - EPSILON_GENERAL || y0_f > dest_map_bound_max_y + EPSILON_GENERAL ||
+                z0_f < dest_map_bound_min_z - EPSILON_GENERAL || z0_f > dest_map_bound_max_z + EPSILON_GENERAL) {
+                continue;
+            }
+
+            int src_col_idx = (int)round(((y1_f + source_map_bound_y1_extent) / source_denom_y1) * (orig_w - 1));
+            int src_row_idx = (int)round(((z1_f + source_map_bound_z1_extent) / source_denom_z1) * (orig_h - 1));
+            src_col_idx = (src_col_idx < 0) ? 0 : (src_col_idx >= orig_w ? orig_w - 1 : src_col_idx);
+            src_row_idx = (src_row_idx < 0) ? 0 : (src_row_idx >= orig_h ? orig_h - 1 : src_row_idx);
+
+            int dest_col_idx = (int)round(((y0_f - dest_map_bound_min_y) / dest_denom_y0) * (mapped_w - 1));
+            int dest_row_idx = (int)round(((z0_f - dest_map_bound_min_z) / dest_denom_z0) * (mapped_h - 1)); 
+
+            if (dest_col_idx < 0 || dest_col_idx >= mapped_w || dest_row_idx < 0 || dest_row_idx >= mapped_h) { continue; }
+
+            size_t dest_pixel_offset = (size_t)dest_row_idx * mapped_w + dest_col_idx;
+            size_t src_pixel_offset  = (size_t)src_row_idx * orig_w * 3 + src_col_idx * 3;
+            
+            sum_r_array[dest_pixel_offset] += source_image_to_use->data[src_pixel_offset + 0];
+            sum_g_array[dest_pixel_offset] += source_image_to_use->data[src_pixel_offset + 1];
+            sum_b_array[dest_pixel_offset] += source_image_to_use->data[src_pixel_offset + 2];
+            count_array_pixels[dest_pixel_offset]++;
+        }
+        free(chunk_data);
+    }
+    printf("\nPhoton processing complete.\n");
+
+    // --- 6. Finalize Image by Averaging ---
+    for (size_t i_pix = 0; i_pix < num_output_pixels; ++i_pix) {
+        if (count_array_pixels[i_pix] > 0) {
+            mapped_image_pixels[i_pix*3 + 0] = (unsigned char)fmax(0, fmin(255, round(sum_r_array[i_pix] / count_array_pixels[i_pix])));
+            mapped_image_pixels[i_pix*3 + 1] = (unsigned char)fmax(0, fmin(255, round(sum_g_array[i_pix] / count_array_pixels[i_pix])));
+            mapped_image_pixels[i_pix*3 + 2] = (unsigned char)fmax(0, fmin(255, round(sum_b_array[i_pix] / count_array_pixels[i_pix])));
+        }
+    }
+
+    // --- 7. Save and Cleanup ---
+    PPMImage final_img = {mapped_image_pixels, mapped_w, mapped_h, 3};
+    if (save_path && strlen(save_path) > 0) { 
+        if (save_ppm_image(save_path, &final_img) == 0) {
+            final_status = 0;
+            printf("Successfully saved lensed image to '%s'.\n", save_path);
+        } else {
+            fprintf(stderr, "map_photons: Failed to save final image to '%s'.\n", save_path);
+            // final_status remains -1
+        }
+    } else {
+        printf("map_photons: Warning - no save_path provided or path is empty. Image not saved.\n");
+        final_status = 0; // Processing was successful, just no save attempted
+    }
+
+cleanup_map_photons: 
+    if(mapped_image_pixels) { free(mapped_image_pixels); mapped_image_pixels = NULL;}
+    if(sum_r_array) { free(sum_r_array); sum_r_array = NULL;}
+    if(sum_g_array) { free(sum_g_array); sum_g_array = NULL;}
+    if(sum_b_array) { free(sum_b_array); sum_b_array = NULL;}
+    if(count_array_pixels) { free(count_array_pixels); count_array_pixels = NULL;}
+cleanup_map_photons_early: 
+    if(source_image_loaded) { free_ppm_image(source_image_loaded); source_image_loaded = NULL;}
+    return final_status;
+}
+
+
+#ifdef UNIT_TEST_PHOTON_RENDERING
+// For a proper unit test of map_photons, you'd need:
+// 1. Mocked/dummy photon chunk files with known data.
+// 2. A known small source image.
+// 3. Pre-calculated expected output image for a given set of parameters.
+// This is more of an integration test.
+// The main_test.c provides better integration testing.
+// Here, we can do a very basic smoke test if chunk files are created by other tests.
+
+int main() {
+    printf("--- Unit Test for photon_rendering (map_photons smoke test) ---\n");
+    gsl_set_error_handler_off();
+
+    // Create a dummy source image for the test
+    PPMImage* dummy_source = create_dummy_ppm(64, 64); // Using helper from main_test.c (needs to be available or reimplemented)
+                                                      // For a true unit test, this helper might be part of a test utils file.
+                                                      // For now, this will only work if linked with main_test.o or if create_dummy_ppm is also in this file.
+                                                      // Let's assume for now this file would be compiled standalone with its own helpers if needed.
+                                                      // Or, better yet, use a tiny actual PPM file for testing.
+    if (!dummy_source) {
+        printf("Failed to create dummy source for map_photons test.\n");
+        return 1;
+    }
+    // Create a dummy photon chunk file
+    const char* dummy_chunk_file = "test_map_photons_chunk.bin";
+    PhotonMapDataPoint pdata[2];
+    pdata[0] = (PhotonMapDataPoint){0.1, 0.1, 0.5, 0.5}; // y0x, y0y, y1x, y1y
+    pdata[1] = (PhotonMapDataPoint){-0.1, -0.1, -0.5, -0.5};
+    if (save_photon_data_chunk(dummy_chunk_file, pdata, 2) != 0) {
+        printf("Failed to save dummy chunk for map_photons test.\n");
+        free_ppm_image(dummy_source);
+        return 1;
+    }
+    char* chunk_list[] = {(char*)dummy_chunk_file, NULL};
+
+    RGBColor bg = {10,20,30};
+    const char* out_file_A = "test_map_photons_ModeA.ppm";
+    const char* out_file_B = "test_map_photons_ModeB.ppm";
+    double obs_window_B[4] = {-0.2, 0.2, -0.2, 0.2};
+
+    printf("Testing map_photons Mode A...\n");
+    int statusA = map_photons(NULL, dummy_source, chunk_list, 1, out_file_A,
+                              1.0, // source_logical_width_input
+                              100, // target_output_pixel_width
+                              NULL, // observer_window_bounds (Mode A)
+                              bg);
+    if (statusA == 0) printf("Mode A smoke test PASSED (file %s potentially created).\n", out_file_A);
+    else printf("Mode A smoke test FAILED (status %d).\n", statusA);
+
+    printf("Testing map_photons Mode B...\n");
+    int statusB = map_photons(NULL, dummy_source, chunk_list, 1, out_file_B,
+                              1.0, // source_logical_width_input
+                              100, // target_output_pixel_width
+                              obs_window_B, // observer_window_bounds (Mode B)
+                              bg);
+    if (statusB == 0) printf("Mode B smoke test PASSED (file %s potentially created).\n", out_file_B);
+    else printf("Mode B smoke test FAILED (status %d).\n", statusB);
+
+    free_ppm_image(dummy_source);
+    remove(dummy_chunk_file);
+    remove(out_file_A);
+    remove(out_file_B);
+
+    printf("--- Unit Test for photon_rendering Finished ---\n");
+    return 0;
+}
+// Need helper function create_dummy_ppm if not linked with main_test.o
+// For simplicity, assume it would be defined here or in a common test util for standalone unit test.
+#ifndef UNIT_TEST_MAIN_FILE // Avoid redefinition if main_test.c includes this as a source
+PPMImage* create_dummy_ppm(int width, int height) {
+    // ... (Simplified dummy implementation for standalone test if needed) ...
+    // ... (This is not ideal, better to link with a common test utils or use actual small files) ...
+    // For this exercise, assume this block would be filled or linked if UNIT_TEST_PHOTON_RENDERING is defined
+    // and this file is compiled as a standalone test. The version in main_test.c is more complete.
+    PPMImage* img = malloc(sizeof(PPMImage));
+    if (!img) return NULL;
+    img->width = width; img->height = height; img->channels = 3;
+    if (width > 0 && height > 0) {
+        img->data = calloc((size_t)width * height * 3, 1);
+        if (!img->data) { free(img); return NULL;}
+    } else {
+        img->data = NULL;
+    }
+    return img;
+}
+#endif // UNIT_TEST_MAIN_FILE
+
+#endif // UNIT_TEST_PHOTON_RENDERING
+
+
+// photon_rendering.c
+// Bottom
+
+// ppm_image_io.c
+// Top
+
+#define _POSIX_C_SOURCE 200809L // For strdup, though not directly used here, good practice if other utils need it
+#include "schwarzschild_tracer.h" // For PPMImage, RGBColor, and other common includes like stdio, stdlib, ctype, string
+// #include <stdio.h>  // Already in schwarzschild_tracer.h
+// #include <stdlib.h> // Already in schwarzschild_tracer.h
+// #include <string.h> // Already in schwarzschild_tracer.h
+// #include <ctype.h>  // Already in schwarzschild_tracer.h
+
+// --- PPM Image I/O (Basic P6 support) ---
+static void skip_ppm_comments_and_whitespace(FILE *fp) {
+    int ch;
+    // Skip leading whitespace
+    while ((ch = fgetc(fp)) != EOF && isspace(ch)) {
+        // Keep reading
+    }
+    // If it's a comment, skip to end of line
+    if (ch == '#') {
+        while ((ch = fgetc(fp)) != EOF && ch != '\n' && ch != '\r') {
+            // Keep reading comment
+        }
+        // After skipping comment, there might be more whitespace or another comment
+        skip_ppm_comments_and_whitespace(fp);
+    } else if (ch != EOF) {
+        // If it wasn't whitespace or '#', put it back
+        ungetc(ch, fp);
+    }
+}
+
+PPMImage* load_ppm_image(const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        perror("load_ppm_image: fopen failed");
+        return NULL;
+    }
+
+    char magic[3];
+    if (fgets(magic, sizeof(magic), fp) == NULL || strncmp(magic, "P6", 2) != 0) {
+        fprintf(stderr, "load_ppm_image: Not a P6 PPM file or read error (magic: %s).\n", magic);
+        fclose(fp);
+        return NULL;
+    }
+
+    PPMImage *image = calloc(1, sizeof(PPMImage));
+    if (!image) {
+        perror("load_ppm_image: calloc PPMImage failed");
+        fclose(fp);
+        return NULL;
+    }
+
+    skip_ppm_comments_and_whitespace(fp);
+    if (fscanf(fp, "%d", &image->width) != 1) {
+        fprintf(stderr, "load_ppm_image: Failed to read width.\n");
+        goto read_error_ppm_load;
+    }
+    skip_ppm_comments_and_whitespace(fp);
+    if (fscanf(fp, "%d", &image->height) != 1) {
+        fprintf(stderr, "load_ppm_image: Failed to read height.\n");
+        goto read_error_ppm_load;
+    }
+    skip_ppm_comments_and_whitespace(fp);
+    int max_val;
+    if (fscanf(fp, "%d", &max_val) != 1 || max_val != 255) {
+        fprintf(stderr, "load_ppm_image: PPM max color value not 255 or read error (max_val: %d).\n", max_val);
+        goto read_error_ppm_load;
+    }
+
+    int ch_after_maxval = fgetc(fp);
+    if (!isspace(ch_after_maxval)) {
+        fprintf(stderr, "load_ppm_image: Expected whitespace after max color value, got '%c' (ASCII: %d).\n", ch_after_maxval, ch_after_maxval);
+        goto read_error_ppm_load;
+    }
+
+    if (image->width <= 0 || image->height <= 0) {
+        fprintf(stderr, "load_ppm_image: Invalid image dimensions %dx%d.\n", image->width, image->height);
+        goto read_error_ppm_load;
+    }
+
+    image->channels = 3;
+    size_t data_size = (size_t)image->width * image->height * image->channels;
+    if (data_size == 0) { // Handle 0xN or Nx0 images
+        image->data = NULL;
+    } else {
+        image->data = malloc(data_size);
+        if (!image->data) {
+            perror("load_ppm_image: malloc for pixel data failed");
+            goto read_error_ppm_load;
+        }
+        if (fread(image->data, sizeof(unsigned char), data_size, fp) != data_size) {
+            perror("load_ppm_image: fread for pixel data failed or short read");
+            free(image->data); image->data = NULL; 
+            goto read_error_ppm_load;
+        }
+    }
+
+    if (fclose(fp) != 0) {
+        perror("load_ppm_image: fclose failed");
+    }
+    return image;
+
+read_error_ppm_load:
+    if (fp) { fclose(fp); }
+    free_ppm_image(image); 
+    return NULL;
+}
+
+int save_ppm_image(const char *filename, const PPMImage *image) {
+    if (!image || image->width <= 0 || image->height <= 0 || image->channels != 3) {
+        // Allow image->data to be NULL if width or height is 0
+        if (!(image && (image->width == 0 || image->height == 0) && image->data == NULL)) {
+             fprintf(stderr, "save_ppm_image: Invalid image data for saving.\n");
+             return -1;
+        }
+    }
+    // If dimensions are zero, but data is not NULL (or vice-versa, excluding valid 0-dim case)
+    if ((image->width == 0 || image->height == 0) && image->data != NULL) {
+        fprintf(stderr, "save_ppm_image: Zero dimensions but non-NULL data.\n");
+        return -1;
+    }
+    if ((image->width > 0 && image->height > 0) && image->data == NULL) {
+        fprintf(stderr, "save_ppm_image: Non-zero dimensions but NULL data.\n");
+        return -1;
+    }
+
+
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        perror("save_ppm_image: fopen failed");
+        return -1;
+    }
+
+    if (fprintf(fp, "P6\n%d %d\n255\n", image->width, image->height) < 0) {
+        perror("save_ppm_image: fprintf header failed");
+        fclose(fp);
+        return -1;
+    }
+
+    if (image->width > 0 && image->height > 0 && image->data) { // Only write data if there is any
+        size_t data_size = (size_t)image->width * image->height * image->channels;
+        if (fwrite(image->data, sizeof(unsigned char), data_size, fp) != data_size) {
+            perror("save_ppm_image: fwrite pixel data failed");
+            fclose(fp);
+            return -1;
+        }
+    }
+
+    if (fclose(fp) != 0) {
+        perror("save_ppm_image: fclose failed");
+        return -1; 
+    }
+    return 0;
+}
+
+void free_ppm_image(PPMImage *image) {
+    if (!image) { return; }
+    if(image->data) { free(image->data); image->data = NULL; } // Good practice to NULL after free
+    free(image);
+}
+
+
+#ifdef UNIT_TEST_PPM_IO
+// Helper to create a dummy PPM for testing
+static PPMImage* test_create_dummy_ppm(int width, int height, unsigned char val) {
+    PPMImage* img = malloc(sizeof(PPMImage));
+    img->width = width; img->height = height; img->channels = 3;
+    if (width == 0 || height == 0) {
+        img->data = NULL;
+        return img;
+    }
+    img->data = malloc((size_t)width * height * 3);
+    for(int i=0; i < width*height*3; ++i) img->data[i] = val + (i % 50); // Some variation
+    return img;
+}
+
+// Compare PPMImages (simplified for test)
+static int test_compare_ppm(const PPMImage* img1, const PPMImage* img2) {
+    if (!img1 && !img2) return 1;
+    if (!img1 || !img2) return 0;
+    if (img1->width != img2->width || img1->height != img2->height || img1->channels != img2->channels) return 0;
+    if ((img1->data == NULL) != (img2->data == NULL)) return 0;
+    if (img1->data) { // If data is not NULL, compare it
+        return memcmp(img1->data, img2->data, (size_t)img1->width * img1->height * img1->channels) == 0;
+    }
+    return 1; // Both NULL data, dimensions match
+}
+
+
+int main() {
+    printf("--- Unit Test for ppm_image_io ---\n");
+    const char* test_file = "test_ppm_io_temp.ppm";
+    PPMImage *img_orig, *img_loaded;
+
+    // Test 1: Save and load a small image
+    img_orig = test_create_dummy_ppm(5, 3, 100);
+    if (!img_orig) { printf("Test 1 FAILED: dummy creation failed\n"); return 1;}
+    printf("Test 1: Saving 5x3 image...\n");
+    if (save_ppm_image(test_file, img_orig) != 0) {
+        printf("Test 1 FAILED: save_ppm_image\n");
+        free_ppm_image(img_orig); return 1;
+    }
+    img_loaded = load_ppm_image(test_file);
+    if (!img_loaded) {
+        printf("Test 1 FAILED: load_ppm_image\n");
+        free_ppm_image(img_orig); remove(test_file); return 1;
+    }
+    if (test_compare_ppm(img_orig, img_loaded)) {
+        printf("Test 1 PASSED\n");
+    } else {
+        printf("Test 1 FAILED: images differ\n");
+    }
+    free_ppm_image(img_orig);
+    free_ppm_image(img_loaded);
+    remove(test_file);
+
+    // Test 2: Zero dimension image
+    img_orig = test_create_dummy_ppm(0, 10, 0); // 0 width
+    printf("Test 2: Saving 0x10 image...\n");
+    if (save_ppm_image(test_file, img_orig) != 0) {
+        printf("Test 2 FAILED: save_ppm_image (0-width)\n");
+        free_ppm_image(img_orig); return 1;
+    }
+    img_loaded = load_ppm_image(test_file);
+     if (!img_loaded) {
+        printf("Test 2 FAILED: load_ppm_image (0-width) returned NULL\n");
+        free_ppm_image(img_orig); remove(test_file); return 1;
+    }
+    if (img_loaded->width == 0 && img_loaded->height == 10 && img_loaded->data == NULL) {
+        printf("Test 2 PASSED (0-width image handling)\n");
+    } else {
+        printf("Test 2 FAILED: 0-width image loaded incorrectly (w:%d,h:%d,data:%p)\n", img_loaded->width, img_loaded->height, (void*)img_loaded->data);
+    }
+    free_ppm_image(img_orig);
+    free_ppm_image(img_loaded);
+    remove(test_file);
+
+    printf("--- Unit Test for ppm_image_io Finished ---\n");
+    return 0;
+}
+#endif // UNIT_TEST_PPM_IO
+
+// ppm_image_io.c
+// Bottom
+
+
+// results_generation.c
+// Top
+
+#define _POSIX_C_SOURCE 200809L // For strdup
+#include "schwarzschild_tracer.h"
+// Includes like stdio.h, stdlib.h, string.h, math.h, time.h, gsl/gsl_vector.h
+// should be covered by schwarzschild_tracer.h
+
+// --- Static Helper Functions ---
+
+// format_coord_str_for_filename: If used by multiple results_... functions, keep it static here.
+// If it were a more general utility, it could go into a utils.c/h.
+static void format_coord_str_for_filename(char *buffer, size_t buffer_size, double val) {
+    char temp[128]; // Sufficient for typical double representations
+    // Use "g" for general format, which is often more compact for numbers like 10.0 or 0.5
+    // and handles scientific notation if needed. Precision can be adjusted.
+    snprintf(temp, sizeof(temp), "%.6g", val); 
+    size_t j = 0; // Current position in buffer
+    for (size_t i = 0; temp[i] != '\0' && j < buffer_size - 1; ++i) {
+        if (temp[i] == '.') {
+            if (j < buffer_size - 1) { buffer[j++] = 'p'; } // Replace '.' with 'p'
+        } else if (temp[i] == '-') {
+            // Ensure enough space for "neg" (3 chars) + at least 1 char for number + null terminator
+            if (j + 3 < buffer_size -1) { // Check against buffer_size - 1 for the char after "neg"
+                buffer[j++] = 'n'; 
+                buffer[j++] = 'e'; 
+                buffer[j++] = 'g';
+            } // else, not enough space for "neg", so skip the minus sign or the whole number part might be truncated.
+              // For simplicity, we just skip the '-' if "neg" doesn't fit.
+        } else if (temp[i] == '+') {
+            // Skip plus signs, usually not needed in filenames
+        } else if (isalnum(temp[i]) || temp[i] == 'e' || temp[i] == 'E') { // Allow e/E for scientific notation
+            if (j < buffer_size - 1) { buffer[j++] = temp[i]; }
+        } // else: skip other non-alphanumeric characters that might arise from %.6g if not careful
+    }
+    buffer[j] = '\0'; // Null-terminate
+}
+
+// add_string_to_list: Similar to format_coord_str_for_filename, static here as it's a direct helper.
+static int add_string_to_list(char*** list_ptr, int* count_ptr, int* capacity_ptr, const char* str_to_add) {
+    if (!list_ptr || !count_ptr || !capacity_ptr) { return -1; /* Invalid arguments */ }
+
+    // Check if reallocation is needed: current count + new string + NULL terminator for list
+    if (*count_ptr + (str_to_add ? 1 : 0) + 1 > *capacity_ptr) {
+        int new_capacity = (*capacity_ptr == 0) ? INITIAL_SAVED_FILES_CAPACITY : *capacity_ptr * 2;
+        // Ensure new_capacity is always large enough even if doubling isn't sufficient
+        if (new_capacity <= *count_ptr + (str_to_add ? 1 : 0)) {
+             new_capacity = *count_ptr + (str_to_add ? 1 : 0) + INITIAL_SAVED_FILES_CAPACITY;
+        }
+
+        char** temp_list = realloc(*list_ptr, new_capacity * sizeof(char*));
+        if (!temp_list) {
+            // fprintf(stderr, "add_string_to_list: Failed to realloc file list to capacity %d.\n", new_capacity);
+            return -2; /* Reallocation failed */
+        }
+        *list_ptr = temp_list;
+        *capacity_ptr = new_capacity;
+    }
+
+    if (str_to_add != NULL) {
+        (*list_ptr)[*count_ptr] = strdup(str_to_add); // strdup is POSIX, ensure _POSIX_C_SOURCE
+        if (!(*list_ptr)[*count_ptr]) {
+            // fprintf(stderr, "add_string_to_list: Failed to strdup filepath.\n");
+            // No easy way to shrink list back if strdup fails mid-way, but this is a critical error.
+            return -3; /* strdup failed */
+        }
+        (*count_ptr)++;
+    }
+    // Always ensure the list is NULL-terminated at the new end (or current end if str_to_add was NULL)
+    (*list_ptr)[*count_ptr] = NULL;
+    return 0; // Success
+}
+
+
+// --- Results Generation Functions ---
+char** results_cartesian(
+    double x_0, double x_1, double x_2, double a_param, int n_param,
+    size_t chunk_size_photons, int* out_num_files_created) {
+
+    if (out_num_files_created) { *out_num_files_created = 0; }
+    if (n_param < 0) { // Basic validation
+        fprintf(stderr, "results_cartesian: n_param cannot be negative.\n");
+        return NULL;
+    }
+    if (chunk_size_photons == 0) chunk_size_photons = DEFAULT_CHUNK_SIZE_PHOTONS;
+
+
+    PhotonMapDataPoint *results_chunk_buffer = malloc(chunk_size_photons * sizeof(PhotonMapDataPoint));
+    if (!results_chunk_buffer) {
+        fprintf(stderr, "results_cartesian: Failed to allocate chunk buffer.\n");
+        return NULL;
+    }
+    size_t current_chunk_fill = 0;
+    char **saved_files_list = NULL;
+    int saved_files_count = 0; 
+    int saved_files_capacity = 0; // Will be initialized by add_string_to_list
+    int chunk_index = 0;
+
+    // Initialize saved_files_list to ensure it's NULL terminated from the start
+    if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, NULL) != 0) {
+        fprintf(stderr, "results_cartesian: Failed to initialize saved_files_list.\n");
+        free(results_chunk_buffer);
+        return NULL;
+    }
+    saved_files_count = 0; // Reset count after initial NULL for proper list management
+
+    printf("Starting Results_Cartesian generation (x0=%.2f, x1=%.2f, x2=%.2f, a=%.2f, n=%d)...\n", x_0, x_1, x_2, a_param, n_param);
+    time_t start_time_sec = time(NULL);
+
+    char x0_str[64], x1_str[64], x2_str[64], n_str_fn[64];
+    format_coord_str_for_filename(x0_str, sizeof(x0_str), x_0);
+    format_coord_str_for_filename(x1_str, sizeof(x1_str), x_1);
+    format_coord_str_for_filename(x2_str, sizeof(x2_str), x_2);
+    snprintf(n_str_fn, sizeof(n_str_fn), "%d", n_param);
+    char base_save_path[MAX_FILENAME_LEN];
+    // Choose a filename that's somewhat descriptive but not overly long before chunk number
+    snprintf(base_save_path, MAX_FILENAME_LEN, "ResCart_x0_%s_x1_%s_x2_%s_n_%s", x0_str, x1_str, x2_str, n_str_fn);
+
+    for (int i = 0; i <= n_param; ++i) {
+        double y_sample = (n_param > 0) ? (a_param * i / n_param) : ( (i > 0) ? a_param : 0.0);
+        for (int j = 0; j <= i; ++j) { // Exploit symmetry Z <= Y
+            double z_sample = (n_param > 0) ? (a_param * j / n_param) : ( (j > 0) ? a_param : 0.0);
+
+            // Progress indicator (adjust frequency as needed)
+            if (n_param > 0 && ( (i * (i+1) / 2 + j) % ( (n_param * n_param / 20) + 1) == 0 || (i == n_param && j == i) ) ) {
+                 printf("  y=%.3f (i=%d/%d), z=%.3f (j=%d/%d) (Chunk %d, Fill %zu/%zu)\n", 
+                        y_sample, i, n_param, z_sample, j, i, chunk_index, current_chunk_fill, chunk_size_photons);
+            } else if (n_param == 0 && i == 0 && j == 0) { // Special case for n_param = 0
+                 printf("  y=%.3f, z=%.3f (Chunk %d, Fill %zu/%zu)\n", y_sample, z_sample, chunk_index, current_chunk_fill, chunk_size_photons);
+            }
+
+
+            double phi_prime_base = (fabs(y_sample) < EPSILON_GENERAL && fabs(z_sample) < EPSILON_GENERAL) ? 0.0 : atan2(z_sample, y_sample);
+            ImageMapResult map_output = image_map(y_sample, z_sample, x_0, x_1, x_2, a_param);
+
+            if (map_output.miss || map_output.error_code != 0) { continue; }
+
+            double y_w = map_output.y_window;
+            double y_i = map_output.y_image;
+            double phi_values_to_use[8];
+            int num_phi_sym_points;
+
+            // Symmetry points based on Python reference
+            if (fabs(y_sample - z_sample) < EPSILON_GENERAL || fabs(z_sample) < EPSILON_GENERAL || fabs(y_sample) < EPSILON_GENERAL ) {
+                num_phi_sym_points = 4; // On axis or diagonal y=z
+                phi_values_to_use[0] = phi_prime_base;
+                phi_values_to_use[1] = phi_prime_base + M_PI / 2.0;
+                phi_values_to_use[2] = phi_prime_base + M_PI;
+                phi_values_to_use[3] = phi_prime_base + 3.0 * M_PI / 2.0;
+            } else { // General case, 8-fold symmetry
+                num_phi_sym_points = 8;
+                phi_values_to_use[0] = phi_prime_base;                     // (y,z)
+                phi_values_to_use[1] = M_PI/2.0 - phi_prime_base;          // (z,y)
+                phi_values_to_use[2] = M_PI/2.0 + phi_prime_base;          // (-z,y)
+                phi_values_to_use[3] = M_PI - phi_prime_base;              // (-y,z)
+                phi_values_to_use[4] = M_PI + phi_prime_base;              // (-y,-z)
+                phi_values_to_use[5] = 3.0*M_PI/2.0 - phi_prime_base;      // (-z,-y)
+                phi_values_to_use[6] = 3.0*M_PI/2.0 + phi_prime_base;      // (z,-y)
+                phi_values_to_use[7] = 2.0*M_PI - phi_prime_base;          // (y,-z)
+            }
+
+            for (int k_phi = 0; k_phi < num_phi_sym_points; ++k_phi) {
+                double phi_p_val_norm = normalize_phi(phi_values_to_use[k_phi]); // Ensure in [0, 2pi)
+                results_chunk_buffer[current_chunk_fill].y_window_cart_x = y_w * cos(phi_p_val_norm);
+                results_chunk_buffer[current_chunk_fill].y_window_cart_y = y_w * sin(phi_p_val_norm);
+                results_chunk_buffer[current_chunk_fill].y_image_cart_x  = y_i * cos(phi_p_val_norm);
+                results_chunk_buffer[current_chunk_fill].y_image_cart_y  = y_i * sin(phi_p_val_norm);
+                current_chunk_fill++;
+
+                if (current_chunk_fill >= chunk_size_photons) {
+                    char chunk_filename[MAX_FILENAME_LEN];
+                    snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+                    if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+                        if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, chunk_filename) != 0) {
+                            fprintf(stderr, "results_cartesian: Failed to add filename to list.\n");
+                            free(results_chunk_buffer); free_string_array(saved_files_list, saved_files_count); 
+                            if(out_num_files_created) *out_num_files_created = saved_files_count;
+                            return NULL; // Critical error
+                        }
+                    } else { fprintf(stderr, "results_cartesian: Failed to save chunk %d to %s.\n", chunk_index, chunk_filename); }
+                    current_chunk_fill = 0;
+                    chunk_index++;
+                }
+            }
+        }
+    }
+
+    if (current_chunk_fill > 0) {
+        char chunk_filename[MAX_FILENAME_LEN];
+        snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+        if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+            if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, chunk_filename) != 0) {
+                 fprintf(stderr, "results_cartesian: Failed to add final filename to list.\n");
+                 free(results_chunk_buffer); free_string_array(saved_files_list, saved_files_count); 
+                 if(out_num_files_created) *out_num_files_created = saved_files_count;
+                 return NULL;
+            }
+        } else { fprintf(stderr, "results_cartesian: Failed to save final chunk %d to %s.\n", chunk_index, chunk_filename); }
+    }
+
+    free(results_chunk_buffer);
+    if (out_num_files_created) { *out_num_files_created = saved_files_count; }
+    // The list is already NULL-terminated by add_string_to_list.
+    printf("\nFinished Results_Cartesian. Time: %ld s. Files created: %d\n", time(NULL) - start_time_sec, saved_files_count);
+    return saved_files_list;
+}
+
+char** results_radial(
+    double x_0, double x_1, double x_2, double R_max_sample, int n_param,
+    size_t chunk_size_photons, int* out_num_files_created) {
+
+    if (out_num_files_created) { *out_num_files_created = 0; }
+     if (n_param < 0) { 
+        fprintf(stderr, "results_radial: n_param cannot be negative.\n");
+        return NULL;
+    }
+    if (chunk_size_photons == 0) chunk_size_photons = DEFAULT_CHUNK_SIZE_PHOTONS;
+
+    PhotonMapDataPoint *results_chunk_buffer = malloc(chunk_size_photons * sizeof(PhotonMapDataPoint));
+    if (!results_chunk_buffer) {
+        fprintf(stderr, "results_radial: Failed to allocate chunk buffer.\n");
+        return NULL;
+    }
+    size_t current_chunk_fill = 0;
+    char **saved_files_list = NULL;
+    int saved_files_count = 0;
+    int saved_files_capacity = 0;
+    int chunk_index = 0;
+
+    if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, NULL) != 0) {
+        fprintf(stderr, "results_radial: Failed to initialize saved_files_list.\n");
+        free(results_chunk_buffer);
+        return NULL;
+    }
+    saved_files_count = 0; 
+
+    printf("Starting Results_Radial generation (x0=%.2f, x1=%.2f, x2=%.2f, Rmax=%.2f, n=%d)...\n", x_0, x_1, x_2, R_max_sample, n_param);
+    time_t start_time_sec = time(NULL);
+
+    double a_scale_for_map = 1.0 * (x_2 - x_1); // As per Python's Results_Radial
+    if (fabs(a_scale_for_map) < EPSILON_GENERAL) { a_scale_for_map = 1.0; }
+
+    char x0_str[64], x1_str[64], x2_str[64], n_str_fn[64], rmax_str[64];
+    format_coord_str_for_filename(x0_str, sizeof(x0_str), x_0);
+    format_coord_str_for_filename(x1_str, sizeof(x1_str), x_1);
+    format_coord_str_for_filename(x2_str, sizeof(x2_str), x_2);
+    format_coord_str_for_filename(rmax_str, sizeof(rmax_str), R_max_sample);
+    snprintf(n_str_fn, sizeof(n_str_fn), "%d", n_param);
+    char base_save_path[MAX_FILENAME_LEN];
+    snprintf(base_save_path, MAX_FILENAME_LEN, "ResRad_x0_%s_x1_%s_x2_%s_Rmax_%s_n_%s", x0_str, x1_str, x2_str, rmax_str, n_str_fn);
+
+    for (int i = 0; i <= n_param; ++i) {
+        double r_s_val = (n_param > 0) ? (R_max_sample * i / n_param) : ( (i > 0) ? R_max_sample : 0.0);
+        // Python: k = max(int(5 * 10**4 * r_sample), int(1))
+        int k_angular_steps = (int)fmax(1.0, (5.0e4 * r_s_val)); 
+
+        if ( i % ( (n_param/10) + 1 ) == 0 || i == n_param ) { // Progress indicator
+             printf("  r_sample=%.4f (i=%d/%d), k_angular_steps=%d (Chunk %d)\n", r_s_val, i, n_param, k_angular_steps, chunk_index);
+        }
+
+        ImageMapResult map_output = image_map_radial(r_s_val, x_0, x_1, x_2, a_scale_for_map);
+        if (map_output.miss || map_output.error_code != 0) { continue; }
+
+        double y_w = map_output.y_window;
+        double y_i = map_output.y_image;
+
+        for (int j = 0; j <= k_angular_steps; ++j) { // Iterate k+1 times to include endpoint
+            double phi_prime_val = (k_angular_steps > 0) ? ((double)j / k_angular_steps * 2.0 * M_PI) : 0.0;
+            double cos_phi = cos(phi_prime_val);
+            double sin_phi = sin(phi_prime_val);
+
+            results_chunk_buffer[current_chunk_fill].y_window_cart_x = y_w * cos_phi;
+            results_chunk_buffer[current_chunk_fill].y_window_cart_y = y_w * sin_phi;
+            results_chunk_buffer[current_chunk_fill].y_image_cart_x  = y_i * cos_phi;
+            results_chunk_buffer[current_chunk_fill].y_image_cart_y  = y_i * sin_phi;
+            current_chunk_fill++;
+
+            if (current_chunk_fill >= chunk_size_photons) {
+                char chunk_filename[MAX_FILENAME_LEN];
+                snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+                if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+                    if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, chunk_filename) != 0) {
+                         fprintf(stderr, "results_radial: Failed to add filename to list.\n");
+                         free(results_chunk_buffer); free_string_array(saved_files_list, saved_files_count); 
+                         if(out_num_files_created) *out_num_files_created = saved_files_count;
+                         return NULL;
+                    }
+                } else { fprintf(stderr, "results_radial: Failed to save chunk %d to %s.\n", chunk_index, chunk_filename); }
+                current_chunk_fill = 0;
+                chunk_index++;
+            }
+        }
+    }
+
+    if (current_chunk_fill > 0) {
+        char chunk_filename[MAX_FILENAME_LEN];
+        snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+        if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+            if (add_string_to_list(&saved_files_list, &saved_files_count, &saved_files_capacity, chunk_filename) != 0) {
+                 fprintf(stderr, "results_radial: Failed to add final filename to list.\n");
+                 free(results_chunk_buffer); free_string_array(saved_files_list, saved_files_count); 
+                 if(out_num_files_created) *out_num_files_created = saved_files_count;
+                 return NULL;
+            }
+        } else { fprintf(stderr, "results_radial: Failed to save final chunk %d to %s.\n", chunk_index, chunk_filename); }
+    }
+
+    free(results_chunk_buffer);
+    if (out_num_files_created) { *out_num_files_created = saved_files_count; }
+    // list already NULL-terminated by add_string_to_list
+    printf("\nFinished Results_Radial. Time: %ld s. Files created: %d\n", time(NULL) - start_time_sec, saved_files_count);
+    return saved_files_list;
+}
+
+ResultsRadialLightRingOutput* results_radial_light_ring(
+    double x_0, double x_1, double x_2, int n_param,
+    size_t chunk_size_photons) {
+
+    ResultsRadialLightRingOutput *output = calloc(1, sizeof(ResultsRadialLightRingOutput));
+    if (!output) { perror("results_radial_light_ring: calloc output failed"); return NULL; }
+    // Initialize fields
+    output->saved_files_list = NULL;
+    output->num_files_created = 0;
+    output->capacity_saved_files = 0;
+    output->r_sample_misses = NULL; // Will be alloc'd by gsl_vector_dynamic_append
+    output->r_sample_hits = NULL;   // Will be alloc'd by gsl_vector_dynamic_append
+
+     if (n_param < 0) { 
+        fprintf(stderr, "results_radial_light_ring: n_param cannot be negative.\n");
+        free_results_radial_light_ring_output(output); return NULL;
+    }
+    if (chunk_size_photons == 0) chunk_size_photons = DEFAULT_CHUNK_SIZE_PHOTONS;
+
+
+    // Initialize misses and hits vectors (dynamic_append will handle first allocation)
+    size_t misses_capacity = 0; // Let dynamic_append manage initial capacity
+    size_t hits_capacity = 0;
+
+    PhotonMapDataPoint *results_chunk_buffer = malloc(chunk_size_photons * sizeof(PhotonMapDataPoint));
+    if (!results_chunk_buffer) {
+        fprintf(stderr, "results_radial_light_ring: Failed to allocate chunk buffer.\n");
+        free_results_radial_light_ring_output(output); return NULL;
+    }
+    size_t current_chunk_fill = 0;
+    int chunk_index = 0;
+
+    if (add_string_to_list(&output->saved_files_list, &output->num_files_created, &output->capacity_saved_files, NULL) != 0) {
+        fprintf(stderr, "results_radial_light_ring: Failed to initialize saved_files_list.\n");
+        free(results_chunk_buffer); free_results_radial_light_ring_output(output);
+        return NULL;
+    }
+    output->num_files_created = 0; 
+
+    printf("Starting Results_Radial_Light_Ring (x0=%.2f, x1=%.2f, x2=%.2f, n=%d)...\n", x_0, x_1, x_2, n_param);
+    time_t start_time_sec = time(NULL);
+
+    double a_scale_lr = 1.0 * (x_2 - x_1); // As per Python's Results_Radial_Light_Ring
+    if (fabs(a_scale_lr) < EPSILON_GENERAL) { a_scale_lr = 1.0; }
+
+    char x0_str[64], x1_str[64], x2_str[64], n_str_fn[64];
+    format_coord_str_for_filename(x0_str, sizeof(x0_str), x_0);
+    format_coord_str_for_filename(x1_str, sizeof(x1_str), x_1);
+    format_coord_str_for_filename(x2_str, sizeof(x2_str), x_2);
+    snprintf(n_str_fn, sizeof(n_str_fn), "%d", n_param);
+    char base_save_path[MAX_FILENAME_LEN];
+    // Python name: Light_Ring_Segement_0th_large_...
+    snprintf(base_save_path, MAX_FILENAME_LEN, "LightRingSeg0thLrg_x0_%s_x1_%s_x2_%s_n_%s", x0_str, x1_str, x2_str, n_str_fn);
+
+    // Constants from Python reference for r_sample range
+    const double r_start_lr_const = 0.2543706590950274;
+    const double r_delta_lr_const = 0.0008610946154524735;
+
+    for (int i = 0; i <= n_param; ++i) {
+        double r_s_val = r_start_lr_const + ((n_param > 0) ? ((double)i / n_param * r_delta_lr_const) : ( (i > 0) ? r_delta_lr_const : 0.0));
+        // Python: k = int(6 * 10**4 * r_sample)
+        int k_angular_steps_lr = (int)fmax(1.0, (6.0e4 * r_s_val));
+
+        if ( i % ( (n_param/10) + 1 ) == 0 || i == n_param ) { // Progress indicator
+             printf("  r_sample=%.7f (i=%d/%d), k_angular_steps=%d (Chunk %d)\n", r_s_val, i, n_param, k_angular_steps_lr, chunk_index);
+        }
+
+        ImageMapResult map_output = image_map_radial(r_s_val, x_0, x_1, x_2, a_scale_lr);
+        if (map_output.miss || map_output.error_code != 0) {
+            if (gsl_vector_dynamic_append(&output->r_sample_misses, r_s_val, &misses_capacity) != 0) {
+                 fprintf(stderr, "results_radial_light_ring: Failed to append to r_sample_misses.\n");
+                 // Continue, but this data point will be lost from misses list
+            }
+            continue;
+        }
+        if (gsl_vector_dynamic_append(&output->r_sample_hits, r_s_val, &hits_capacity) != 0) {
+             fprintf(stderr, "results_radial_light_ring: Failed to append to r_sample_hits.\n");
+             // Continue, but this data point will be lost from hits list
+        }
+
+
+        double y_w = map_output.y_window;
+        double y_i = map_output.y_image;
+        // Constants from Python reference for phi_prime range
+        const double phi_prime_start_angle_lr = 3.0/2.0 * M_PI;
+        const double phi_prime_angular_width_lr = M_PI / 180.0 / 10.0; // 0.1 degrees
+
+        for (int j = 0; j <= k_angular_steps_lr; ++j) {
+            double phi_prime_val = phi_prime_start_angle_lr + 
+                                   ((k_angular_steps_lr > 0) ? ((double)j / k_angular_steps_lr * phi_prime_angular_width_lr) : 0.0);
+            double cos_phi = cos(phi_prime_val);
+            double sin_phi = sin(phi_prime_val);
+
+            results_chunk_buffer[current_chunk_fill].y_window_cart_x = y_w * cos_phi;
+            results_chunk_buffer[current_chunk_fill].y_window_cart_y = y_w * sin_phi;
+            results_chunk_buffer[current_chunk_fill].y_image_cart_x  = y_i * cos_phi;
+            results_chunk_buffer[current_chunk_fill].y_image_cart_y  = y_i * sin_phi;
+            current_chunk_fill++;
+
+            if (current_chunk_fill >= chunk_size_photons) {
+                char chunk_filename[MAX_FILENAME_LEN];
+                snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+                if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+                    if (add_string_to_list(&output->saved_files_list, &output->num_files_created, &output->capacity_saved_files, chunk_filename) != 0) {
+                         fprintf(stderr, "results_radial_light_ring: Failed to add filename to list.\n");
+                         free(results_chunk_buffer); free_results_radial_light_ring_output(output); return NULL;
+                    }
+                } else { fprintf(stderr, "results_radial_light_ring: Failed to save chunk %d to %s.\n", chunk_index, chunk_filename); }
+                current_chunk_fill = 0;
+                chunk_index++;
+            }
+        }
+    }
+
+    if (current_chunk_fill > 0) {
+        char chunk_filename[MAX_FILENAME_LEN];
+        snprintf(chunk_filename, MAX_FILENAME_LEN, "%s_chunk_%03d.bin", base_save_path, chunk_index);
+        if (save_photon_data_chunk(chunk_filename, results_chunk_buffer, current_chunk_fill) == 0) {
+            if (add_string_to_list(&output->saved_files_list, &output->num_files_created, &output->capacity_saved_files, chunk_filename) != 0) {
+                 fprintf(stderr, "results_radial_light_ring: Failed to add final filename to list.\n");
+                 free(results_chunk_buffer); free_results_radial_light_ring_output(output); return NULL;
+            }
+        } else { fprintf(stderr, "results_radial_light_ring: Failed to save final chunk %d to %s.\n", chunk_index, chunk_filename); }
+    }
+
+    free(results_chunk_buffer);
+    // List already NULL-terminated by add_string_to_list
+    printf("\nFinished Results_Radial_Light_Ring. Time: %ld s. Files created: %d\n", time(NULL) - start_time_sec, output->num_files_created);
+    return output;
+}
+
+void free_results_radial_light_ring_output(ResultsRadialLightRingOutput* output) {
+    if (!output) { return; }
+    if (output->saved_files_list) {
+        // Assumes add_string_to_list correctly manages count for NULL terminator
+        free_string_array(output->saved_files_list, output->num_files_created); 
+        output->saved_files_list = NULL;
+    }
+    if(output->r_sample_misses) { gsl_vector_free(output->r_sample_misses); output->r_sample_misses = NULL;}
+    if(output->r_sample_hits) { gsl_vector_free(output->r_sample_hits); output->r_sample_hits = NULL; }
+    free(output);
+}
+
+// This function is public API, so it should be here or in a general utils.c
+void free_string_array(char** arr, int count) {
+    if (!arr) { return; }
+    // Iterate up to 'count' which is the number of actual strings,
+    // not capacity. The (count)-th element should be the NULL from add_string_to_list
+    for (int i = 0; i < count; ++i) { 
+        if (arr[i]) { free(arr[i]); arr[i] = NULL; }
+    }
+    free(arr);
+}
+
+
+#ifdef UNIT_TEST_RESULTS_GENERATION
+// This would be a more involved unit test, requiring image_map to work,
+// and compute_trajectory_crossings_only, etc. It's more of an integration test.
+// For true unit tests of results_*, one might mock image_map.
+// For now, a simple smoke test calling one of them with small params.
+int main() {
+    printf("--- Unit Test for results_generation (smoke test) ---\n");
+    gsl_set_error_handler_off();
+    int num_files = 0;
+
+    printf("Testing results_radial with minimal parameters...\n");
+    char** r_files = results_radial(-10.0, 19.0, 20.0, 0.1, 2, 100, &num_files);
+    if (r_files != NULL && num_files > 0) {
+        printf("  results_radial smoke test PASSED. Generated %d file(s).\n", num_files);
+        // Could try to load and check one file if desired.
+        for(int i=0; i<num_files; ++i) remove(r_files[i]); // Clean up test files
+        free_string_array(r_files, num_files);
+    } else if (r_files == NULL && num_files == 0) {
+        printf("  results_radial smoke test ran, produced 0 files (as might be expected for minimal params).\n");
+    }
+    else {
+        printf("  results_radial smoke test FAILED.\n");
+        if(r_files) free_string_array(r_files, num_files);
+    }
+    
+    printf("Testing results_cartesian with minimal parameters...\n");
+    num_files = 0;
+    char** c_files = results_cartesian(-10.0, 19.0, 20.0, 0.1, 1, 100, &num_files);
+     if (c_files != NULL && num_files > 0) {
+        printf("  results_cartesian smoke test PASSED. Generated %d file(s).\n", num_files);
+        for(int i=0; i<num_files; ++i) remove(c_files[i]); // Clean up test files
+        free_string_array(c_files, num_files);
+    } else if (c_files == NULL && num_files == 0) {
+        printf("  results_cartesian smoke test ran, produced 0 files.\n");
+    } else {
+        printf("  results_cartesian smoke test FAILED.\n");
+        if(c_files) free_string_array(c_files, num_files);
+    }
+
+    // results_radial_light_ring is more specific, skip detailed unit test here for brevity
+    // but could be added similarly.
+
+    printf("--- Unit Test for results_generation Finished ---\n");
+    return 0;
+}
+#endif // UNIT_TEST_RESULTS_GENERATION
+
+
+// results_generation.c
+// Bottom
+
+// trajectory_module.c
+// Top
+
+#define _POSIX_C_SOURCE 200809L 
+#include "schwarzschild_tracer.h" 
+#include <float.h> // For DBL_MAX, DBL_EPSILON (ensure this is here)
+// Other includes like math.h, string.h, stdio.h, stdlib.h, gsl/* should be in schwarzschild_tracer.h
+
+// --- Helper Macros ---
+#define CHECK_GSL_ALLOC_VEC_CORE(ptr, func_name, item_name_str, err_var, err_val, cleanup_label) \
+    if ((ptr) == NULL) { fprintf(stderr, "%s: GSL vector allocation failed for %s\n", func_name, item_name_str); err_var = err_val; goto cleanup_label; }
+#define CHECK_ALLOC_GEN_CORE(ptr, func_name, type_name_str, err_var, err_val, cleanup_label) \
+    if ((ptr) == NULL) { fprintf(stderr, "%s: Standard allocation failed for %s\n", func_name, type_name_str); err_var = err_val; goto cleanup_label; }
+
+// --- Internal Struct Definitions for this Compilation Unit ---
+typedef struct {
+    EventFunctionParams *event_params_root; 
+    double K_prev_step, K_curr_step;
+    double y_state_prev_step[2];
+    double y_state_curr_step[2];
+    double (*get_event_val_func_root)(double, const double[], EventFunctionParams*);
+} GslRootEventParams;
+
+typedef struct {
+    gsl_vector *K_pts;
+    gsl_vector *r_pts;
+    gsl_vector *phi_pts;
+} TrajectorySegmentDataInternal;
+
+
+// --- Static Function Definitions (internal helpers) ---
+
+static int schwarzschild_geodesic_eqs(double K, const double y_state[], double f_derivs[], void *params_ptr) {
+    (void)K; 
+    ODEParams *params = (ODEParams *)params_ptr;
+    double M = params->M; double b = params->b; int sign_val = *(params->sign_dr_dk);
+    double r = y_state[0];
+
+    if (r <= (2.0 * M + EVENT_DETECTION_TOLERANCE * 0.01)) { 
+        f_derivs[0] = 0.0; f_derivs[1] = 0.0; return GSL_SUCCESS;
+    }
+    double metric_term = (1.0 - 2.0 * M / r);
+    if (metric_term < 0 && r > 2.0 * M) { metric_term = 0.0; }
+
+    double term_b_r_sq = (b / r) * (b / r) ;
+    double fr_val = 1.0 - metric_term * term_b_r_sq;
+    if (fr_val < 0) { fr_val = 0.0; }
+
+    f_derivs[0] = sign_val * sqrt(fr_val);
+    if (r < EPSILON_GENERAL) { f_derivs[1] = 0.0; }
+    else { f_derivs[1] = b / (r * r); }
+    return GSL_SUCCESS;
+}
+
+static double get_event_val_fr_zero(double K, const double y_state[], EventFunctionParams *params) {
+    (void)K; double r = y_state[0]; double M = params->ode_p_event->M; double b = params->ode_p_event->b;
+    if (r <= (2.0 * M + EVENT_DETECTION_TOLERANCE * 0.1)) { return 0.0; }
+    double metric_term = (1.0 - 2.0 * M / r); double term_b_r_sq = (b / r) * (b / r);
+    return 1.0 - metric_term * term_b_r_sq;
+}
+static double get_event_val_r_leq_2M(double K, const double y_state[], EventFunctionParams *params) {
+    (void)K; return y_state[0] - (2.0 * params->M + EVENT_DETECTION_TOLERANCE * 0.1); }
+static double get_event_val_r_max(double K, const double y_state[], EventFunctionParams *params) {
+    (void)K; return y_state[0] - params->r_max_event; }
+static double get_event_val_x_stop(double K, const double y_state[], EventFunctionParams *params) {
+    (void)K; double r = y_state[0]; double phi = y_state[1];
+    if (r < EPSILON_GENERAL) { return 1.0; }
+    return r * cos(phi) - params->x_stop_event; }
+static double get_event_val_x_target(double K, const double y_state[], EventFunctionParams *params) {
+    (void)K; double r = y_state[0]; double phi = y_state[1];
+    if (r < EPSILON_GENERAL) { return 1.0; }
+    return r * cos(phi) - params->x_target_event; }
+
+static double gsl_root_event_wrapper(double K_test, void *params_ptr) {
+    GslRootEventParams *root_p = (GslRootEventParams *)params_ptr;
+    double y_interp[2];
+    if (fabs(root_p->K_curr_step - root_p->K_prev_step) < DBL_EPSILON) {
+        y_interp[0] = root_p->y_state_curr_step[0];
+        y_interp[1] = root_p->y_state_curr_step[1];
+    } else {
+        double fraction = (K_test - root_p->K_prev_step) / (root_p->K_curr_step - root_p->K_prev_step);
+        fraction = fmax(0.0, fmin(1.0, fraction));
+        y_interp[0] = root_p->y_state_prev_step[0] + fraction * (root_p->y_state_curr_step[0] - root_p->y_state_prev_step[0]);
+        y_interp[1] = root_p->y_state_prev_step[1] + fraction * (root_p->y_state_curr_step[1] - root_p->y_state_prev_step[1]);
+    }
+    return root_p->get_event_val_func_root(K_test, y_interp, root_p->event_params_root);
+}
+
+static int find_event_time_gsl(
+    double K_start_interval, double y_start_interval[],
+    double K_end_interval, double y_end_interval[],
+    double (*get_event_val_func_gsl)(double, const double[], EventFunctionParams*),
+    EventFunctionParams *event_p_gsl, int crossing_direction,
+    double *K_event_found_gsl, double y_event_found_gsl[]) {
+
+    int iter = 0, max_iter = 100;
+    const gsl_root_fsolver_type *T_solver = gsl_root_fsolver_brent;
+    gsl_root_fsolver *s_solver = gsl_root_fsolver_alloc(T_solver);
+    if (!s_solver) { /*fprintf(stderr, "find_event_time_gsl: Failed to allocate GSL root solver.\n");*/ return 0; }
+
+    gsl_function F_gsl_root;
+    GslRootEventParams root_params_instance;
+    root_params_instance.get_event_val_func_root = get_event_val_func_gsl;
+    root_params_instance.event_params_root = event_p_gsl;
+    root_params_instance.K_prev_step = K_start_interval;
+    root_params_instance.K_curr_step = K_end_interval;
+    memcpy(root_params_instance.y_state_prev_step, y_start_interval, 2 * sizeof(double));
+    memcpy(root_params_instance.y_state_curr_step, y_end_interval, 2 * sizeof(double));
+
+    F_gsl_root.function = &gsl_root_event_wrapper;
+    F_gsl_root.params = &root_params_instance;
+
+    double val_start = get_event_val_func_gsl(K_start_interval, y_start_interval, event_p_gsl);
+    double val_end = get_event_val_func_gsl(K_end_interval, y_end_interval, event_p_gsl);
+
+    bool bracketed = false;
+    if (crossing_direction == 0) {
+        if (val_start * val_end <= EVENT_DETECTION_TOLERANCE * EVENT_DETECTION_TOLERANCE) { bracketed = true; }
+    } else if (crossing_direction < 0) {
+        if (val_start > -EVENT_DETECTION_TOLERANCE && val_end <= EVENT_DETECTION_TOLERANCE) { bracketed = true; }
+    } else {
+        if (val_start < EVENT_DETECTION_TOLERANCE && val_end >= -EVENT_DETECTION_TOLERANCE) { bracketed = true; }
+    }
+    if (fabs(val_start) < EVENT_DETECTION_TOLERANCE) {
+        *K_event_found_gsl = K_start_interval; memcpy(y_event_found_gsl, y_start_interval, 2 * sizeof(double));
+        gsl_root_fsolver_free(s_solver); return 1;
+    }
+    if (fabs(val_end) < EVENT_DETECTION_TOLERANCE && K_end_interval > K_start_interval) {
+        *K_event_found_gsl = K_end_interval; memcpy(y_event_found_gsl, y_end_interval, 2 * sizeof(double));
+        gsl_root_fsolver_free(s_solver); return 1;
+    }
+    if (!bracketed) { gsl_root_fsolver_free(s_solver); return 0; }
+
+    int status_set = gsl_root_fsolver_set(s_solver, &F_gsl_root, K_start_interval, K_end_interval);
+    if (status_set != GSL_SUCCESS) { gsl_root_fsolver_free(s_solver); return 0; }
+
+    int status_iterate;
+    do {
+        iter++;
+        status_iterate = gsl_root_fsolver_iterate(s_solver);
+        if (status_iterate != GSL_SUCCESS && status_iterate != GSL_CONTINUE) {
+             gsl_root_fsolver_free(s_solver); return 0;
+        }
+        *K_event_found_gsl = gsl_root_fsolver_root(s_solver);
+        double K_low = gsl_root_fsolver_x_lower(s_solver);
+        double K_high = gsl_root_fsolver_x_upper(s_solver);
+        status_iterate = gsl_root_test_interval(K_low, K_high, 0, EVENT_DETECTION_TOLERANCE);
+    } while (status_iterate == GSL_CONTINUE && iter < max_iter);
+
+    gsl_root_fsolver_free(s_solver);
+    if (status_iterate != GSL_SUCCESS) { return 0; }
+
+    if (fabs(K_end_interval - K_start_interval) < DBL_EPSILON) {
+         memcpy(y_event_found_gsl, y_end_interval, 2 * sizeof(double));
+    } else {
+        double fraction = (*K_event_found_gsl - K_start_interval) / (K_end_interval - K_start_interval);
+        fraction = fmax(0.0, fmin(1.0, fraction));
+        y_event_found_gsl[0] = y_start_interval[0] + fraction * (y_end_interval[0] - y_start_interval[0]);
+        y_event_found_gsl[1] = y_start_interval[1] + fraction * (y_end_interval[1] - y_start_interval[1]);
+    }
+    return 1;
+}
+
+static int reallocate_gsl_vector_if_needed(
+    gsl_vector **vec_ptr,                   
+    size_t current_logical_element_count,   
+    size_t *current_physical_capacity_ptr,  
+    size_t initial_capacity_val) {          
+
+    if (!vec_ptr || !current_physical_capacity_ptr) {
+        return -1; 
+    }
+    if (current_logical_element_count >= *current_physical_capacity_ptr) {
+        size_t new_physical_capacity;
+        if (*current_physical_capacity_ptr > 0) {
+            new_physical_capacity = *current_physical_capacity_ptr * 2; 
+        } else {
+            new_physical_capacity = initial_capacity_val; 
+        }
+        if (new_physical_capacity <= current_logical_element_count) {
+            new_physical_capacity = current_logical_element_count + initial_capacity_val;
+            if (new_physical_capacity <= current_logical_element_count) { 
+                new_physical_capacity = current_logical_element_count + 1; 
+            }
+        }
+        gsl_vector *new_v = gsl_vector_alloc(new_physical_capacity);
+        if (!new_v) {
+            return -1; 
+        }
+        gsl_vector *old_v = *vec_ptr; 
+        if (old_v) { 
+            size_t num_elements_to_copy = current_logical_element_count;
+            if (num_elements_to_copy > old_v->size) {
+                num_elements_to_copy = old_v->size; 
+            }
+            if (num_elements_to_copy > 0) {
+                 gsl_vector_const_view old_subvector_to_copy = gsl_vector_const_subvector(old_v, 0, num_elements_to_copy);
+                 gsl_vector_view new_subvector_to_paste_into = gsl_vector_subvector(new_v, 0, num_elements_to_copy);
+                 gsl_vector_memcpy(&new_subvector_to_paste_into.vector, &old_subvector_to_copy.vector);
+            }
+            gsl_vector_free(old_v); 
+        }
+        *vec_ptr = new_v; 
+        *current_physical_capacity_ptr = new_physical_capacity; 
+    }
+    return 0; 
+}
+
+int gsl_vector_dynamic_append(gsl_vector **vec_ptr, double value_param, size_t *current_capacity_ptr) {
+    if (!vec_ptr || !current_capacity_ptr) { return -1; }
+
+    if (!(*vec_ptr)) { 
+        *current_capacity_ptr = INITIAL_CROSSING_POINTS_CAPACITY; 
+        *vec_ptr = gsl_vector_alloc(*current_capacity_ptr); 
+        if (!(*vec_ptr)) { 
+            fprintf(stderr, "gsl_vector_dynamic_append: Initial allocation failed.\n");
+            return -1; 
+        }
+        (*vec_ptr)->size = 0; 
+    }
+    
+    // The third argument to reallocate_gsl_vector_if_needed IS current_capacity_ptr itself
+    // because reallocate_gsl_vector_if_needed expects a (size_t *)
+    if (reallocate_gsl_vector_if_needed(vec_ptr, (*vec_ptr)->size, current_capacity_ptr, INITIAL_CROSSING_POINTS_CAPACITY) != 0) {
+        return -1; 
+    }
+    
+    size_t index_to_set = (*vec_ptr)->size;
+
+    // CORRECTED LINE: Use the function's parameter name 'current_capacity_ptr'
+    if ((*vec_ptr)->data && index_to_set < *current_capacity_ptr) { 
+        (*vec_ptr)->data[index_to_set] = value_param; 
+    } else {
+        // Also use 'current_capacity_ptr' in the error message
+        fprintf(stderr, "DYNAMIC_APPEND_ERROR: Invalid state for direct write. Index: %zu, Tracked Capacity: %zu, Data Ptr: %p\n",
+                index_to_set, *current_capacity_ptr, (void*)((*vec_ptr) ? (*vec_ptr)->data : NULL) ); 
+        return -2; 
+    }
+
+    (*vec_ptr)->size++; 
+    return 0;
+}
+
+double normalize_phi(double phi) {
+    phi = fmod(phi, 2.0 * M_PI);
+    if (phi < 0.0) {
+        phi += 2.0 * M_PI;
+    }
+    return phi;
+}
+
+static void unwrap_phi_values(const gsl_vector* K_raw, const gsl_vector* phi_raw, gsl_vector* phi_unwrapped) {
+    if (!K_raw || !phi_raw || !phi_unwrapped || K_raw->size != phi_raw->size || K_raw->size != phi_unwrapped->size || K_raw->size == 0) {
+        return;
+    }
+    gsl_vector_set(phi_unwrapped, 0, gsl_vector_get(phi_raw, 0));
+    double prev_unwrapped_val = gsl_vector_get(phi_unwrapped, 0);
+
+    for (size_t i = 1; i < K_raw->size; ++i) {
+        double current_raw_val = gsl_vector_get(phi_raw, i);
+        double diff_from_prev_unwrapped = current_raw_val - prev_unwrapped_val;
+        
+        double adjusted_delta = fmod(diff_from_prev_unwrapped + M_PI, 2.0 * M_PI) - M_PI;
+        if (adjusted_delta == -M_PI && diff_from_prev_unwrapped > 0) { 
+             adjusted_delta = M_PI;
+        }
+
+        double new_unwrapped_val = prev_unwrapped_val + adjusted_delta;
+        gsl_vector_set(phi_unwrapped, i, new_unwrapped_val);
+        prev_unwrapped_val = new_unwrapped_val;
+    }
+}
+
+// Static variable to count calls to the core function
+static int integrate_photon_trajectory_core_call_count = 0; // File-scope static
+
+// Core integration logic - kept static as it's an internal implementation detail
+static int integrate_photon_trajectory_core(
+    double r_0, double phi_0, double M_val, double psi, double r_max_val,
+    double x_stop_val, bool x_stop_active_flag,
+    const gsl_vector *x_targets_vec,
+    double t_end_max_overall, 
+    double rtol, double atol,
+    PhotonTrajectory *full_traj_output,   
+    TrajectoryCrossings *crossings_output, 
+    int num_interp_points_for_full_traj
+) {
+    // *** PASTED THE FULL BODY OF integrate_photon_trajectory_core HERE ***
+    // *** FROM schwarzschild_tracer_c.txt (THE VERSION WE DEBUGGED EXTENSIVELY) ***
+    integrate_photon_trajectory_core_call_count++;
+    int current_call_instance = integrate_photon_trajectory_core_call_count;
+
+    int core_error_code = 0;
+    double K_final_reached_integration = 0.0;
+
+    gsl_odeiv2_driver *driver = NULL;
+    TrajectorySegmentDataInternal *segments_collected_list = NULL;
+    size_t num_segments_collected = 0;
+    size_t segments_collected_capacity = 0;
+    gsl_vector *current_segment_K_temp = NULL, *current_segment_r_temp = NULL, *current_segment_phi_temp = NULL;
+    size_t current_segment_point_count = 0; 
+    size_t current_segment_K_capacity = 0;    
+    size_t current_segment_r_capacity = 0;    
+    size_t current_segment_phi_capacity = 0;  
+    gsl_vector **crossings_collector_ptr = NULL;
+    size_t *crossings_collector_capacities = NULL;
+    size_t num_x_targets_val = 0;
+    gsl_vector *K_all_raw = NULL, *r_all_raw = NULL, *phi_all_raw_temp = NULL, *phi_unwrapped_all = NULL;
+    gsl_spline *spline_r_interp = NULL, *spline_phi_interp = NULL;
+    gsl_interp_accel *acc_r_interp = NULL, *acc_phi_interp = NULL;
+
+    if (r_0 <= (2.0 * M_val + EPSILON_GENERAL) || r_0 >= r_max_val) {
+        K_final_reached_integration = 0.0;
+        if (full_traj_output) {
+            int n_pts_trivial = (num_interp_points_for_full_traj > 0) ? num_interp_points_for_full_traj : 1;
+            if (n_pts_trivial <=0) n_pts_trivial = 1; // Ensure at least one point
+            full_traj_output->K = gsl_vector_calloc(n_pts_trivial); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->K, "core (trivial K)", "K", core_error_code, -1, cleanup_core);
+            full_traj_output->r = gsl_vector_calloc(n_pts_trivial); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->r, "core (trivial r)", "r", core_error_code, -1, cleanup_core);
+            full_traj_output->phi = gsl_vector_calloc(n_pts_trivial); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->phi, "core (trivial phi)", "phi", core_error_code, -1, cleanup_core);
+            full_traj_output->x = gsl_vector_calloc(n_pts_trivial); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->x, "core (trivial x)", "x", core_error_code, -1, cleanup_core);
+            full_traj_output->y = gsl_vector_calloc(n_pts_trivial); CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->y, "core (trivial y)", "y", core_error_code, -1, cleanup_core);
+
+            double phi_norm_init = normalize_phi(phi_0);
+            for (int i = 0; i < n_pts_trivial; ++i) {
+                gsl_vector_set(full_traj_output->K, i, 0.0);
+                gsl_vector_set(full_traj_output->r, i, r_0);
+                gsl_vector_set(full_traj_output->phi, i, phi_norm_init);
+                gsl_vector_set(full_traj_output->x, i, r_0 * cos(phi_norm_init));
+                gsl_vector_set(full_traj_output->y, i, r_0 * sin(phi_norm_init));
+            }
+            full_traj_output->num_x_targets = x_targets_vec ? x_targets_vec->size : 0;
+            if (full_traj_output->num_x_targets > 0) {
+                full_traj_output->crossings_y_at_x_targets = calloc(full_traj_output->num_x_targets, sizeof(gsl_vector*));
+                CHECK_ALLOC_GEN_CORE(full_traj_output->crossings_y_at_x_targets, "core (trivial cr_y)", "gsl_vec**", core_error_code, -1, cleanup_core);
+                for (size_t i = 0; i < full_traj_output->num_x_targets; ++i) {
+                    full_traj_output->crossings_y_at_x_targets[i] = gsl_vector_alloc(0); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->crossings_y_at_x_targets[i], "core (trivial cr[i])", "cr_y[i]", core_error_code, -1, cleanup_core);
+                }
+            } else { full_traj_output->crossings_y_at_x_targets = NULL; }
+             full_traj_output->error_code = 0; 
+        }
+        if (crossings_output) {
+            crossings_output->num_x_targets = x_targets_vec ? x_targets_vec->size : 0;
+            if (crossings_output->num_x_targets > 0) {
+                crossings_output->crossings_y_at_x_targets = calloc(crossings_output->num_x_targets, sizeof(gsl_vector*));
+                CHECK_ALLOC_GEN_CORE(crossings_output->crossings_y_at_x_targets, "core (trivial cr_out_arr)", "gsl_vec**", core_error_code, -1, cleanup_core);
+                for (size_t i = 0; i < crossings_output->num_x_targets; ++i) {
+                    crossings_output->crossings_y_at_x_targets[i] = gsl_vector_alloc(0);
+                    CHECK_GSL_ALLOC_VEC_CORE(crossings_output->crossings_y_at_x_targets[i], "core (trivial cr_out[i])", "cr_out[i]", core_error_code, -1, cleanup_core);
+                }
+            } else { crossings_output->crossings_y_at_x_targets = NULL; }
+            crossings_output->error_code = 0; 
+        }
+        goto cleanup_core; 
+    }
+
+    double metric_r0_term = (1.0 - 2.0 * M_val / r_0);
+    if (metric_r0_term <= EPSILON_GENERAL) {K_final_reached_integration = 0.0; goto cleanup_core;} // Should be caught by r_0 <= 2M
+
+    double b_val = cos(psi) * r_0 / sqrt(metric_r0_term);
+    int current_sign_dr_dk;
+    // ... (Logic for current_sign_dr_dk as in your file) ...
+    if (fabs(b_val) < 1e-9) { 
+        double sin_psi_val = sin(psi);
+        if (sin_psi_val > EPSILON_GENERAL) { current_sign_dr_dk = 1; }
+        else if (sin_psi_val < -EPSILON_GENERAL) { current_sign_dr_dk = -1; }
+        else { current_sign_dr_dk = 1; } // Default for ambiguous purely radial
+    } else { 
+        if (sin(psi) > EPSILON_GENERAL) { current_sign_dr_dk = 1; }
+        else if (sin(psi) < -EPSILON_GENERAL) { current_sign_dr_dk = -1; }
+        else { current_sign_dr_dk = 1; } // Default for purely tangential
+    }
+
+    ODEParams ode_params_instance;
+    ode_params_instance.M = M_val;
+    ode_params_instance.b = b_val;
+    ode_params_instance.sign_dr_dk = &current_sign_dr_dk;
+
+    gsl_odeiv2_system sys = {schwarzschild_geodesic_eqs, NULL, 2, &ode_params_instance};
+    double initial_driver_step = (rtol < 1e-9 || atol < 1e-9) ? 1e-5 : 1e-6; // Adjusted initial step
+    driver = gsl_odeiv2_driver_alloc_y_new(&sys, gsl_odeiv2_step_rkf45, initial_driver_step, rtol, atol);
+    CHECK_ALLOC_GEN_CORE(driver, "core (driver)", "gsl_odeiv2_driver", core_error_code, -2, cleanup_core);
+
+    double K_loop_variable = 0.0; 
+    double y_current_state[2] = {r_0, phi_0};
+
+    if (full_traj_output) {
+        segments_collected_capacity = INITIAL_SEGMENTS_CAPACITY;
+        segments_collected_list = malloc(segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
+        CHECK_ALLOC_GEN_CORE(segments_collected_list, "core (segments_list)", "SegList", core_error_code, -1, cleanup_core);
+        for(size_t i=0; i<segments_collected_capacity; ++i) { // Initialize pointers
+            segments_collected_list[i].K_pts = NULL; segments_collected_list[i].r_pts = NULL; segments_collected_list[i].phi_pts = NULL;
+        }
+        current_segment_K_capacity = INITIAL_RAW_POINTS_CAPACITY;
+        current_segment_r_capacity = INITIAL_RAW_POINTS_CAPACITY;
+        current_segment_phi_capacity = INITIAL_RAW_POINTS_CAPACITY;
+        current_segment_K_temp = gsl_vector_alloc(current_segment_K_capacity); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_K_temp, "core (K_temp init)", "K_temp", core_error_code, -1, cleanup_core);
+        current_segment_r_temp = gsl_vector_alloc(current_segment_r_capacity); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_r_temp, "core (r_temp init)", "r_temp", core_error_code, -1, cleanup_core);
+        current_segment_phi_temp = gsl_vector_alloc(current_segment_phi_capacity); 
+        CHECK_GSL_ALLOC_VEC_CORE(current_segment_phi_temp, "core (phi_temp init)", "phi_temp", core_error_code, -1, cleanup_core);
+        
+        gsl_vector_set(current_segment_K_temp, 0, K_loop_variable); 
+        gsl_vector_set(current_segment_r_temp, 0, y_current_state[0]);
+        gsl_vector_set(current_segment_phi_temp, 0, y_current_state[1]);
+        current_segment_point_count = 1;
+    }
+
+    if (x_targets_vec && (full_traj_output || crossings_output)) {
+        num_x_targets_val = x_targets_vec->size;
+        if (num_x_targets_val > 0) {
+            crossings_collector_ptr = calloc(num_x_targets_val, sizeof(gsl_vector*)); 
+            CHECK_ALLOC_GEN_CORE(crossings_collector_ptr, "core (cr_coll_ptr)","gsl_vec**", core_error_code, -1, cleanup_core);
+            crossings_collector_capacities = calloc(num_x_targets_val, sizeof(size_t)); 
+            CHECK_ALLOC_GEN_CORE(crossings_collector_capacities, "core (cr_coll_cap)","size_t*", core_error_code, -1, cleanup_core);
+            for (size_t i = 0; i < num_x_targets_val; ++i) {
+                crossings_collector_capacities[i] = INITIAL_CROSSING_POINTS_CAPACITY; // Init capacity for each
+                crossings_collector_ptr[i] = gsl_vector_alloc(crossings_collector_capacities[i]); 
+                CHECK_GSL_ALLOC_VEC_CORE(crossings_collector_ptr[i], "core (cr_coll[i])","coll[i]", core_error_code, -1, cleanup_core);
+                crossings_collector_ptr[i]->size = 0; // Important: GSL vector size tracks used elements
+            }
+        }
+    }
+    
+    EventFunctionParams event_params_instances[MAX_EVENT_TYPES_CORE]; // MAX_EVENT_TYPES_CORE from .h
+    double (*event_get_val_func_ptrs[MAX_EVENT_TYPES_CORE])(double, const double[], EventFunctionParams*);
+    bool event_is_terminal[MAX_EVENT_TYPES_CORE];
+    int event_crossing_dir[MAX_EVENT_TYPES_CORE];
+    int event_is_x_target_idx_map[MAX_EVENT_TYPES_CORE]; 
+    size_t num_active_event_funcs = 0;
+
+    // ... (Event setup logic - copied verbatim from your file) ...
+    event_params_instances[num_active_event_funcs].ode_p_event = &ode_params_instance;
+    event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_fr_zero;
+    event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = 0;
+    event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
+
+    event_params_instances[num_active_event_funcs].M = M_val; 
+    event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_r_leq_2M;
+    event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = -1;
+    event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
+
+    event_params_instances[num_active_event_funcs].r_max_event = r_max_val;
+    event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_r_max;
+    event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = 1; 
+    event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
+    
+    if (x_stop_active_flag) {
+        event_params_instances[num_active_event_funcs].x_stop_event = x_stop_val;
+        event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_x_stop;
+        event_is_terminal[num_active_event_funcs] = true; event_crossing_dir[num_active_event_funcs] = -1; 
+        event_is_x_target_idx_map[num_active_event_funcs] = -1; num_active_event_funcs++;
+    }
+
+    if (x_targets_vec && num_x_targets_val > 0) {
+        for (size_t i = 0; i < num_x_targets_val; ++i) {
+            if (num_active_event_funcs >= MAX_EVENT_TYPES_CORE) { 
+                fprintf(stderr, "integrate_photon_trajectory_core: Too many event types defined.\n"); 
+                core_error_code = -2; goto cleanup_core; // Use main cleanup
+            }
+            event_params_instances[num_active_event_funcs].x_target_event = gsl_vector_get(x_targets_vec, i);
+            event_get_val_func_ptrs[num_active_event_funcs] = get_event_val_x_target;
+            event_is_terminal[num_active_event_funcs] = false; 
+            event_crossing_dir[num_active_event_funcs] = -1;   
+            event_is_x_target_idx_map[num_active_event_funcs] = (int)i; 
+            num_active_event_funcs++;
+        }
+    }
+
+    int integration_stop_code = 0; 
+    int safety_break_counter = 0;
+    const int MAX_SAFETY_BREAK_CORE = 200000; 
+    const double MIN_K_PROGRESS_PER_ITER = 1e-12; 
+
+        while (K_loop_variable < t_end_max_overall && integration_stop_code == 0 && safety_break_counter < MAX_SAFETY_BREAK_CORE) {
+        safety_break_counter++;
+        double K_iter_start_val = K_loop_variable; 
+        double y_iter_start_state[2]; 
+        memcpy(y_iter_start_state, y_current_state, 2 * sizeof(double));
+
+        double K_target_for_this_gsl_step = K_iter_start_val + MAX_K_PER_GSL_SUPER_STEP;
+        if (K_target_for_this_gsl_step > t_end_max_overall) {
+            K_target_for_this_gsl_step = t_end_max_overall;
+        }
+        
+        if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER && K_iter_start_val >= t_end_max_overall - EPSILON_GENERAL) {
+            integration_stop_code = 1; 
+            K_final_reached_integration = t_end_max_overall;
+            K_loop_variable = t_end_max_overall;
+            break;
+        }
+        if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER) {
+            // Try a much smaller fraction of the super step if the full super step is too small
+            K_target_for_this_gsl_step = K_iter_start_val + MAX_K_PER_GSL_SUPER_STEP * 0.01; 
+             if (K_target_for_this_gsl_step > t_end_max_overall) K_target_for_this_gsl_step = t_end_max_overall;
+             if (K_target_for_this_gsl_step <= K_iter_start_val + MIN_K_PROGRESS_PER_ITER){
+                  integration_stop_code = 1;
+                  K_final_reached_integration = t_end_max_overall;
+                  K_loop_variable = t_end_max_overall;
+                  break;
+             }
+        }
+        
+        
+        double K_gsl_inout = K_iter_start_val; 
+        int status = gsl_odeiv2_driver_apply(driver, &K_gsl_inout, K_target_for_this_gsl_step, y_current_state);
+        double K_gsl_step_end = K_gsl_inout; 
+
+
+        if (status != GSL_SUCCESS) {
+            fprintf(stderr, "GSL ODE solver error: %s (K_start_iter=%.2e, r=%.2e, phi=%.2e)\n", gsl_strerror(status), K_iter_start_val, y_iter_start_state[0], y_iter_start_state[1]);
+            integration_stop_code = 3; K_final_reached_integration = K_iter_start_val; break;
+        }
+
+        if (fabs(K_gsl_step_end - K_iter_start_val) < DBL_EPSILON * fabs(K_iter_start_val) + 10.0 * DBL_MIN) {
+            if (safety_break_counter > 50) { 
+                fprintf(stderr, "Warning: GSL ODE solver stalled at K=%.15e (K_start_iter=%.15e, h=%.3e). Terminating integration.\n", 
+                        K_gsl_step_end, K_iter_start_val, driver->h);
+                integration_stop_code = 4; 
+                K_final_reached_integration = K_gsl_step_end; 
+                break;
+            }
+        }
+        K_final_reached_integration = K_gsl_step_end; 
+
+        if (full_traj_output) {
+            // Pass the correct individual capacity variable for each vector
+            if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, current_segment_point_count, &current_segment_K_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                reallocate_gsl_vector_if_needed(&current_segment_r_temp, current_segment_point_count, &current_segment_r_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                reallocate_gsl_vector_if_needed(&current_segment_phi_temp, current_segment_point_count, &current_segment_phi_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
+                integration_stop_code = 3; K_final_reached_integration = K_iter_start_val; break; 
+            }
+            gsl_vector_set(current_segment_K_temp, current_segment_point_count, K_gsl_step_end);
+            gsl_vector_set(current_segment_r_temp, current_segment_point_count, y_current_state[0]); 
+            gsl_vector_set(current_segment_phi_temp, current_segment_point_count, y_current_state[1]);
+
+            
+            current_segment_point_count++;
+        }
+
+        double earliest_K_event_this_step = K_gsl_step_end + 1.0; 
+        int triggered_event_func_original_idx = -1;
+        double y_at_earliest_event_this_step[2];
+        y_at_earliest_event_this_step[0] = NAN; y_at_earliest_event_this_step[1] = NAN;
+
+        for (size_t ev_idx = 0; ev_idx < num_active_event_funcs; ++ev_idx) {
+            double K_event_found_type; double y_event_found_type[2];
+            int event_found_flag = find_event_time_gsl(
+                K_iter_start_val, y_iter_start_state,    
+                K_gsl_step_end, y_current_state,         
+                event_get_val_func_ptrs[ev_idx], &event_params_instances[ev_idx],
+                event_crossing_dir[ev_idx], &K_event_found_type, y_event_found_type
+            );
+
+            if (event_found_flag) {
+                bool accept_this_specific_event = false;
+                if (event_is_terminal[ev_idx]) {
+                    if (K_event_found_type >= K_iter_start_val - EVENT_DETECTION_TOLERANCE &&
+                        K_event_found_type <= K_gsl_step_end + EVENT_DETECTION_TOLERANCE) {
+                        accept_this_specific_event = true;
+                    }
+                } else { 
+                    if (K_event_found_type > K_iter_start_val + (EVENT_DETECTION_TOLERANCE * 0.1) && 
+                        K_event_found_type <= K_gsl_step_end + EVENT_DETECTION_TOLERANCE) {
+                        accept_this_specific_event = true;
+                    }
+                }
+
+                if (accept_this_specific_event) {
+                    if (K_event_found_type < earliest_K_event_this_step) {
+                        earliest_K_event_this_step = K_event_found_type;
+                        triggered_event_func_original_idx = ev_idx;
+                        memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                    } else if (fabs(K_event_found_type - earliest_K_event_this_step) < EVENT_DETECTION_TOLERANCE * 0.01) {
+                        if (event_get_val_func_ptrs[ev_idx] == get_event_val_fr_zero) { 
+                            earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                        } else if (event_get_val_func_ptrs[ev_idx] == get_event_val_r_leq_2M && event_get_val_func_ptrs[triggered_event_func_original_idx] != get_event_val_fr_zero) {
+                            earliest_K_event_this_step = K_event_found_type; triggered_event_func_original_idx = ev_idx; memcpy(y_at_earliest_event_this_step, y_event_found_type, 2 * sizeof(double));
+                        }
+                    }
+                }
+            }
+        } 
+
+        if (triggered_event_func_original_idx != -1) { 
+
+            K_loop_variable = earliest_K_event_this_step; 
+            memcpy(y_current_state, y_at_earliest_event_this_step, 2 * sizeof(double)); 
+            K_final_reached_integration = K_loop_variable; 
+
+            if (full_traj_output && current_segment_point_count > 0) {
+                size_t last_idx_in_temp = current_segment_point_count - 1; 
+                gsl_vector_set(current_segment_K_temp, last_idx_in_temp, K_loop_variable); 
+                gsl_vector_set(current_segment_r_temp, last_idx_in_temp, y_current_state[0]); 
+                gsl_vector_set(current_segment_phi_temp, last_idx_in_temp, y_current_state[1]); 
+            }
+
+            int x_target_list_idx = event_is_x_target_idx_map[triggered_event_func_original_idx];
+            if (x_target_list_idx != -1) { 
+                if (crossings_collector_ptr && x_target_list_idx < (int)num_x_targets_val) {
+                    double r_event_val = y_at_earliest_event_this_step[0];
+                    if (r_event_val >= (2 * M_val + EPSILON_GENERAL) && r_event_val >= 1e-10) { 
+                        double y_val_to_add_crossing = y_at_earliest_event_this_step[0] * sin(y_at_earliest_event_this_step[1]);
+
+                        if (gsl_vector_dynamic_append(&crossings_collector_ptr[x_target_list_idx], y_val_to_add_crossing, &crossings_collector_capacities[x_target_list_idx]) != 0) {
+                            integration_stop_code = 3; K_final_reached_integration = K_loop_variable; break;
+                        }
+                    }
+                }
+                K_loop_variable += EVENT_DETECTION_TOLERANCE * 10.0; 
+                K_final_reached_integration = K_loop_variable; 
+            } else if (event_is_terminal[triggered_event_func_original_idx]) { 
+                if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_fr_zero) { 
+                    current_sign_dr_dk *= -1;
+                    //y_current_state[0] += (EVENT_DETECTION_TOLERANCE * 10.0) * current_sign_dr_dk; 
+                    //K_loop_variable += EVENT_DETECTION_TOLERANCE * 10.0;
+                    y_current_state[0] += (1e-7) * current_sign_dr_dk; // Match Python's r nudge
+                    K_loop_variable += 1e-7;  
+                    K_final_reached_integration = K_loop_variable;
+
+                    if (y_current_state[0] <= (2*M_val + EPSILON_GENERAL) || y_current_state[0] >= r_max_val ||
+                        (x_stop_active_flag && (y_current_state[0]*cos(y_current_state[1]) <= x_stop_val + EPSILON_GENERAL))) {
+
+
+                        integration_stop_code = 2; 
+                    }
+
+                    if (full_traj_output && integration_stop_code != 2) { 
+                        if (num_segments_collected >= segments_collected_capacity) {
+                            segments_collected_capacity = (segments_collected_capacity == 0) ? INITIAL_SEGMENTS_CAPACITY : segments_collected_capacity * 2;
+                            TrajectorySegmentDataInternal *temp_realloc = realloc(segments_collected_list, segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
+                            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc seg_list)", "SegList", integration_stop_code, 3, cleanup_core); // Use main cleanup on alloc fail here
+                            segments_collected_list = temp_realloc;
+                        }
+                        
+                        
+                        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (seg K)", "K_seg", integration_stop_code, 3, cleanup_core);
+                        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (seg r)", "r_seg", integration_stop_code, 3, cleanup_core);
+                        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (seg phi)", "phi_seg", integration_stop_code, 3, cleanup_core);
+                        
+                        for(size_t k=0; k<current_segment_point_count; ++k) {
+                            gsl_vector_set(segments_collected_list[num_segments_collected].K_pts, k, gsl_vector_get(current_segment_K_temp, k));
+                            gsl_vector_set(segments_collected_list[num_segments_collected].r_pts, k, gsl_vector_get(current_segment_r_temp, k));
+                            gsl_vector_set(segments_collected_list[num_segments_collected].phi_pts, k, gsl_vector_get(current_segment_phi_temp, k));
+                        }
+                        num_segments_collected++;
+                        current_segment_point_count = 0; 
+                        // Start new segment with the nudged state
+                        if (reallocate_gsl_vector_if_needed(&current_segment_K_temp, 0, &current_segment_K_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                        reallocate_gsl_vector_if_needed(&current_segment_r_temp, 0, &current_segment_r_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0 ||
+                        reallocate_gsl_vector_if_needed(&current_segment_phi_temp, 0, &current_segment_phi_capacity, INITIAL_RAW_POINTS_CAPACITY) != 0) {
+                        integration_stop_code = 3; K_final_reached_integration = K_loop_variable; break;
+                    }
+                    // Since current_segment_point_count is 0, these set the first element (index 0) of the new segment
+                    gsl_vector_set(current_segment_K_temp, 0, K_loop_variable);
+                    gsl_vector_set(current_segment_r_temp, 0, y_current_state[0]);
+                    gsl_vector_set(current_segment_phi_temp, 0, y_current_state[1]);
+                    current_segment_point_count = 1; 
+                
+
+                        if (current_call_instance == 1 && num_segments_collected == 1) { // We are building the second segment
+                        if (current_segment_point_count == 255 || current_segment_point_count == 256 || current_segment_point_count == 257) {
+                        printf("DEBUG_SEG1_BUILD (Iter %d, Seg1_LocalIdx %zu): K_gsl_step_end=%.15e, r=%.3e, phi=%.3e. Stored K=%.15e\n",
+                       safety_break_counter,
+                       current_segment_point_count, // This is the index where it's about to be written
+                       K_gsl_step_end,
+                       y_current_state[0],
+                       y_current_state[1],
+                       gsl_vector_get(current_segment_K_temp, current_segment_point_count) // Read back what was just written
+                       );
+                        fflush(stdout);
+                        }
+                        
+
+                        }
+
+
+                        current_segment_point_count = 1;
+                     
+                    }
+                    } else {  integration_stop_code = 2; // This 'else' handles OTHER terminal events (NOT fr_zero)
+                    char event_name[50] = "Unknown";
+                    if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_r_leq_2M) {
+                        strcpy(event_name, "r_leq_2M");
+                    } else if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_r_max) {
+                        strcpy(event_name, "r_max");
+                    } else if (event_get_val_func_ptrs[triggered_event_func_original_idx] == get_event_val_x_stop) {
+                        strcpy(event_name, "x_stop");
+                    }
+                    // Add more 'else if' for any other distinct terminal event types
+
+                    integration_stop_code = 2; // Terminate integration due to this event
+                }
+
+
+                
+
+                
+            }
+
+        // Near the end of the if (triggered_event_func_original_idx != -1) block
+        } else { 
+            K_loop_variable = K_gsl_step_end; 
+        }
+
+        if (integration_stop_code != 0) { break; } 
+
+        if (K_loop_variable >= t_end_max_overall - EPSILON_GENERAL) { 
+            integration_stop_code = 1; 
+            K_final_reached_integration = t_end_max_overall; 
+            K_loop_variable = t_end_max_overall; 
+        }
+        if (fabs(K_loop_variable - K_iter_start_val) < MIN_K_PROGRESS_PER_ITER && safety_break_counter > 100 && integration_stop_code == 0) {
+            fprintf(stderr, "Warning: Minimal K progress in iteration %d (K_start_iter=%.15e, K_loop_var_end_iter=%.15e). Terminating.\n",
+                    safety_break_counter, K_iter_start_val, K_loop_variable);
+            integration_stop_code = 5; 
+            K_final_reached_integration = K_loop_variable;
+            break;
+        }
+    } 
+
+    if (safety_break_counter >= MAX_SAFETY_BREAK_CORE) {
+        fprintf(stderr, "Warning: Max safety break counter (%d) reached. K_final=%.15e\n", MAX_SAFETY_BREAK_CORE, K_final_reached_integration);
+        if (integration_stop_code == 0) { integration_stop_code = 2; } 
+    }
+    // ... (other termination messages integration_stop_code 4, 5) ...
+
+    // --- Final Segment Storage (if any points remain in current_segment_...) ---
+    if (full_traj_output && current_segment_point_count > 0 && integration_stop_code != 3) { 
+        if (num_segments_collected >= segments_collected_capacity) {
+            segments_collected_capacity = (segments_collected_capacity == 0) ? INITIAL_SEGMENTS_CAPACITY : segments_collected_capacity * 2;
+            TrajectorySegmentDataInternal *temp_realloc = realloc(segments_collected_list, segments_collected_capacity * sizeof(TrajectorySegmentDataInternal));
+            CHECK_ALLOC_GEN_CORE(temp_realloc, "core (realloc final seg_list)", "SegList", integration_stop_code, 3, cleanup_core_post_loop); 
+            segments_collected_list = temp_realloc;
+        }
+        // This segment K_pts etc should be allocated with current_segment_point_count
+        segments_collected_list[num_segments_collected].K_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].K_pts, "core (final K_seg)", "K_seg", integration_stop_code, 3, cleanup_core_post_loop);
+        segments_collected_list[num_segments_collected].r_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].r_pts, "core (final r_seg)", "r_seg", integration_stop_code, 3, cleanup_core_post_loop);
+        segments_collected_list[num_segments_collected].phi_pts = gsl_vector_alloc(current_segment_point_count); CHECK_GSL_ALLOC_VEC_CORE(segments_collected_list[num_segments_collected].phi_pts, "core (final phi_seg)", "phi_seg", integration_stop_code, 3, cleanup_core_post_loop);
+        
+        for(size_t k=0; k<current_segment_point_count; ++k) {
+            gsl_vector_set(segments_collected_list[num_segments_collected].K_pts, k, gsl_vector_get(current_segment_K_temp, k));
+            gsl_vector_set(segments_collected_list[num_segments_collected].r_pts, k, gsl_vector_get(current_segment_r_temp, k));
+            gsl_vector_set(segments_collected_list[num_segments_collected].phi_pts, k, gsl_vector_get(current_segment_phi_temp, k));
+        }
+
+        
+        num_segments_collected++;
+    }
+cleanup_core_post_loop: {} 
+
+
+
+    // --- Interpolation Logic ---
+    // Check if full trajectory output is requested and no critical error occurred during integration
+    if (full_traj_output && integration_stop_code != 3 && integration_stop_code != 4 && integration_stop_code != 5) {
+        
+        // Scenario 1: Trivial case where output might have been pre-filled by the function's initial r0 checks.
+        if (num_segments_collected == 0 && 
+            fabs(K_final_reached_integration - 0.0) < DBL_EPSILON &&
+            (full_traj_output->K && full_traj_output->K->size >= 1 && fabs(gsl_vector_get(full_traj_output->K,0) - 0.0) < DBL_EPSILON)) {
+            // Data was likely set by the initial trivial case handler. No further interpolation needed.
+
+        } 
+        // Scenario 2: Segments were collected, and integration ended reasonably. Proceed to interpolate.
+        else if (num_segments_collected > 0 && K_final_reached_integration >= -EPSILON_GENERAL) {
+            size_t total_raw_points = 0;
+            for (size_t s = 0; s < num_segments_collected; ++s) {
+                if (segments_collected_list[s].K_pts) { 
+                     total_raw_points += segments_collected_list[s].K_pts->size;
+                } else {
+                    fprintf(stderr, "Warning C%d: Null K_pts in segment %zu during interpolation prep.\n", current_call_instance, s);
+                }
+            }
+
+
+            if (total_raw_points >= 1) { 
+                int n_pts_interp_actual = (num_interp_points_for_full_traj > 0) ? num_interp_points_for_full_traj : 1;
+                
+                if (full_traj_output->K == NULL || full_traj_output->K->size != (size_t)n_pts_interp_actual) {
+                    gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;
+                    gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;
+                    gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;
+                    gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;
+                    gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;
+                    
+                    full_traj_output->K = gsl_vector_calloc(n_pts_interp_actual); // Use calloc for safety
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->K, "core (interp K)", "K", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->r = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->r, "core (interp r)", "r", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->phi = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->phi, "core (interp phi)", "phi", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->x = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->x, "core (interp x)", "x", integration_stop_code, 3, cleanup_core_interp);
+                    full_traj_output->y = gsl_vector_calloc(n_pts_interp_actual); 
+                    CHECK_GSL_ALLOC_VEC_CORE(full_traj_output->y, "core (interp y)", "y", integration_stop_code, 3, cleanup_core_interp);
+                }
+
+                K_all_raw = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(K_all_raw, "core (K_all_raw)", "K_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
+                r_all_raw = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(r_all_raw, "core (r_all_raw)", "r_all_raw", integration_stop_code, 3, cleanup_core_interp_arrays);
+                phi_all_raw_temp = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(phi_all_raw_temp, "core (phi_all_raw_temp)", "phi_all_raw_temp", integration_stop_code, 3, cleanup_core_interp_arrays);
+
+                size_t current_concat_idx = 0;
+                for (size_t s = 0; s < num_segments_collected; ++s) {
+                     if (!segments_collected_list[s].K_pts || segments_collected_list[s].K_pts->size == 0) continue; 
+                    for (size_t i = 0; i < segments_collected_list[s].K_pts->size; ++i) {
+                        if (current_concat_idx < total_raw_points) { 
+                            gsl_vector_set(K_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].K_pts, i));
+                            gsl_vector_set(r_all_raw, current_concat_idx, gsl_vector_get(segments_collected_list[s].r_pts, i));
+                            gsl_vector_set(phi_all_raw_temp, current_concat_idx, gsl_vector_get(segments_collected_list[s].phi_pts, i));
+                            current_concat_idx++;
+                        } else {
+                            fprintf(stderr, "Warning C%d: Concatenation index %zu exceeded total_raw_points %zu.\n", current_call_instance, current_concat_idx, total_raw_points);
+                            goto end_concat_loop; 
+                        }
+                    }
+                }
+                end_concat_loop:;
+                
+                if (current_concat_idx < total_raw_points) {
+                    fprintf(stderr, "Warning C%d: Final concatenated points (%zu) < initially calculated total_raw_points (%zu). Using actual count.\n", current_call_instance, current_concat_idx, total_raw_points);
+                    total_raw_points = current_concat_idx;
+                     if (total_raw_points == 0) {
+                        fprintf(stderr, "Error C%d: No valid raw points to interpolate after concat adjustments.\n", current_call_instance);
+                        if (full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+                        // (and r,phi,x,y)
+                        goto cleanup_core_interp_arrays; 
+                     }
+                }
+                
+
+                phi_unwrapped_all = gsl_vector_alloc(total_raw_points); 
+                CHECK_GSL_ALLOC_VEC_CORE(phi_unwrapped_all, "core (phi_unwrapped)", "phi_unwrapped", integration_stop_code, 3, cleanup_core_interp_arrays);
+                
+                gsl_vector_const_view K_all_raw_v = gsl_vector_const_subvector(K_all_raw, 0, total_raw_points);
+                gsl_vector_const_view phi_all_raw_temp_v = gsl_vector_const_subvector(phi_all_raw_temp, 0, total_raw_points);
+                unwrap_phi_values(&K_all_raw_v.vector, &phi_all_raw_temp_v.vector, phi_unwrapped_all);
+                
+                
+
+
+                if (total_raw_points == 1) { 
+                    for (size_t i = 0; i < full_traj_output->K->size; ++i) { 
+                        gsl_vector_set(full_traj_output->K, i, gsl_vector_get(K_all_raw, 0));
+                        double r_val = gsl_vector_get(r_all_raw, 0);
+                        double phi_val_norm = normalize_phi(gsl_vector_get(phi_unwrapped_all, 0));
+                        gsl_vector_set(full_traj_output->r, i, r_val);
+                        gsl_vector_set(full_traj_output->phi, i, phi_val_norm);
+                        gsl_vector_set(full_traj_output->x, i, r_val * cos(phi_val_norm));
+                        gsl_vector_set(full_traj_output->y, i, r_val * sin(phi_val_norm));
+                    }
+                } else { // total_raw_points > 1
+
+                    const gsl_interp_type *spline_type_cspline = gsl_interp_cspline;
+                    const gsl_interp_type *spline_type_linear = gsl_interp_linear;
+                    const gsl_interp_type *spline_type = (total_raw_points >= gsl_interp_type_min_size(spline_type_cspline)) ? spline_type_cspline : spline_type_linear;
+
+                    spline_r_interp = gsl_spline_alloc(spline_type, total_raw_points); 
+                    CHECK_ALLOC_GEN_CORE(spline_r_interp, "core (spline_r)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
+                    spline_phi_interp = gsl_spline_alloc(spline_type, total_raw_points); 
+                    CHECK_ALLOC_GEN_CORE(spline_phi_interp, "core (spline_phi)", "gsl_spline", integration_stop_code, 3, cleanup_core_interp_splines);
+                    acc_r_interp = gsl_interp_accel_alloc(); 
+                    CHECK_ALLOC_GEN_CORE(acc_r_interp, "core (acc_r)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
+                    acc_phi_interp = gsl_interp_accel_alloc(); 
+                    CHECK_ALLOC_GEN_CORE(acc_phi_interp, "core (acc_phi)", "gsl_interp_accel", integration_stop_code, 3, cleanup_core_interp_splines);
+
+                    gsl_vector_const_view r_all_raw_v = gsl_vector_const_subvector(r_all_raw, 0, total_raw_points);
+                    
+                    gsl_spline_init(spline_r_interp, K_all_raw_v.vector.data, r_all_raw_v.vector.data, total_raw_points);
+                    gsl_spline_init(spline_phi_interp, K_all_raw_v.vector.data, phi_unwrapped_all->data, total_raw_points);
+
+                    double K_interp_val_start = gsl_vector_get(&K_all_raw_v.vector, 0);
+                    double K_interp_val_end = K_final_reached_integration; 
+                                        
+                    if (K_interp_val_end < K_interp_val_start - EPSILON_GENERAL) { 
+                         fprintf(stderr, "Warning C%d: K_interp_val_end (%.15e) < K_interp_val_start (%.15e) for spline. Using K_interp_val_start as end.\n", current_call_instance, K_interp_val_end, K_interp_val_start);
+                         K_interp_val_end = K_interp_val_start;
+                    }
+
+                    for (size_t i = 0; i < full_traj_output->K->size; ++i) {
+                        double K_val_to_eval = (full_traj_output->K->size > 1) ?
+                            (K_interp_val_start + (double)i * (K_interp_val_end - K_interp_val_start) / (double)(full_traj_output->K->size - 1)) : K_interp_val_end;
+                        
+                        double K_spline_data_start = gsl_vector_get(K_all_raw, 0); 
+                        double K_spline_data_end = gsl_vector_get(K_all_raw, total_raw_points - 1);
+                        K_val_to_eval = fmax(K_spline_data_start, fmin(K_spline_data_end, K_val_to_eval)); 
+
+                        double r_val = gsl_spline_eval(spline_r_interp, K_val_to_eval, acc_r_interp);
+                        double phi_unwrapped_val = gsl_spline_eval(spline_phi_interp, K_val_to_eval, acc_phi_interp);
+                        double phi_val_norm = normalize_phi(phi_unwrapped_val);
+
+                        gsl_vector_set(full_traj_output->K, i, K_val_to_eval);
+                        gsl_vector_set(full_traj_output->r, i, r_val);
+                        gsl_vector_set(full_traj_output->phi, i, phi_val_norm);
+                        gsl_vector_set(full_traj_output->x, i, r_val * cos(phi_val_norm));
+                        gsl_vector_set(full_traj_output->y, i, r_val * sin(phi_val_norm));
+                    }
+                cleanup_core_interp_splines: 
+                    if(spline_r_interp) { gsl_spline_free(spline_r_interp); spline_r_interp = NULL; }
+                    if(spline_phi_interp) { gsl_spline_free(spline_phi_interp); spline_phi_interp = NULL; }
+                    if(acc_r_interp) { gsl_interp_accel_free(acc_r_interp); acc_r_interp = NULL; }
+                    if(acc_phi_interp) { gsl_interp_accel_free(acc_phi_interp); acc_phi_interp = NULL; }
+                } 
+            cleanup_core_interp_arrays: 
+                if(K_all_raw) { gsl_vector_free(K_all_raw); K_all_raw = NULL; }
+                if(r_all_raw) { gsl_vector_free(r_all_raw); r_all_raw = NULL; }
+                if(phi_all_raw_temp) { gsl_vector_free(phi_all_raw_temp); phi_all_raw_temp = NULL; }
+                if(phi_unwrapped_all) { gsl_vector_free(phi_unwrapped_all); phi_unwrapped_all = NULL; }
+                 // If integration_stop_code was set to 3 by a CHECK_ macro in this block,
+                 // full_traj_output->K might be non-NULL but other vectors might be NULL.
+                 // The error_code setting later will handle this.
+            }  else { // total_raw_points < 1
+                fprintf(stderr, "Warning C%d: No raw points available for interpolation. Output K will be NULL.\n", current_call_instance);
+                if (full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+                if (full_traj_output->r) { gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;}
+                if (full_traj_output->phi) { gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;}
+                if (full_traj_output->x) { gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;}
+                if (full_traj_output->y) { gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;}
+            }
+        cleanup_core_interp:; 
+        } else if (integration_stop_code != 3 && integration_stop_code != 4 && integration_stop_code != 5) {
+            // This branch means: (num_segments_collected == 0 AND not the initial trivial case) OR K_final_reached_integration was negative.
+            // Implies something went wrong very early, or no valid segments.
+            fprintf(stderr, "Warning C%d: No segments collected or K_final invalid for interpolation. K_final=%.3e. Output K will be NULL.\n", current_call_instance, K_final_reached_integration);
+            if (full_traj_output && full_traj_output->K) { gsl_vector_free(full_traj_output->K); full_traj_output->K = NULL;}
+            if (full_traj_output && full_traj_output->r) { gsl_vector_free(full_traj_output->r); full_traj_output->r = NULL;}
+            if (full_traj_output && full_traj_output->phi) { gsl_vector_free(full_traj_output->phi); full_traj_output->phi = NULL;}
+            if (full_traj_output && full_traj_output->x) { gsl_vector_free(full_traj_output->x); full_traj_output->x = NULL;}
+            if (full_traj_output && full_traj_output->y) { gsl_vector_free(full_traj_output->y); full_traj_output->y = NULL;}
+        }
+        
+        if (full_traj_output) { 
+            if (full_traj_output->crossings_y_at_x_targets) { 
+                for (size_t i = 0; i < full_traj_output->num_x_targets; ++i) {
+                    if(full_traj_output->crossings_y_at_x_targets[i]) {
+                        gsl_vector_free(full_traj_output->crossings_y_at_x_targets[i]);
+                    }
+                }
+                free(full_traj_output->crossings_y_at_x_targets);
+            }
+            full_traj_output->crossings_y_at_x_targets = crossings_collector_ptr;
+            full_traj_output->num_x_targets = num_x_targets_val;
+            crossings_collector_ptr = NULL; 
+            if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
+        }
+        
+        if (full_traj_output && full_traj_output->error_code == 0 && (integration_stop_code >= 3 && integration_stop_code <= 5) ) { 
+            full_traj_output->error_code = -2; 
+        }
+    } // end if (full_traj_output && integration_stop_code not critical error)
+
+    if (crossings_output) {
+        if (crossings_collector_ptr) { 
+            if (crossings_output->crossings_y_at_x_targets) { 
+                for (size_t i = 0; i < crossings_output->num_x_targets; ++i) {
+                    if(crossings_output->crossings_y_at_x_targets[i]) {
+                        gsl_vector_free(crossings_output->crossings_y_at_x_targets[i]);
+                    }
+                }
+                free(crossings_output->crossings_y_at_x_targets);
+            }
+            crossings_output->crossings_y_at_x_targets = crossings_collector_ptr;
+            crossings_output->num_x_targets = num_x_targets_val;
+            crossings_collector_ptr = NULL; 
+            if(crossings_collector_capacities) { free(crossings_collector_capacities); crossings_collector_capacities = NULL; }
+        }
+        crossings_output->error_code = (integration_stop_code >= 3 && integration_stop_code <=5) ? -2 : 0;
+    }
+
+cleanup_core:
+    if(driver) gsl_odeiv2_driver_free(driver);
+    if(current_segment_K_temp) gsl_vector_free(current_segment_K_temp);
+    if(current_segment_r_temp) gsl_vector_free(current_segment_r_temp);
+    if(current_segment_phi_temp) gsl_vector_free(current_segment_phi_temp);
+    if(segments_collected_list){
+        for(size_t i=0; i<num_segments_collected; ++i){
+            if(segments_collected_list[i].K_pts) gsl_vector_free(segments_collected_list[i].K_pts);
+            if(segments_collected_list[i].r_pts) gsl_vector_free(segments_collected_list[i].r_pts);
+            if(segments_collected_list[i].phi_pts) gsl_vector_free(segments_collected_list[i].phi_pts);
+        }
+        free(segments_collected_list);
+    }
+    if(crossings_collector_ptr){
+        for(size_t i=0; i<num_x_targets_val; ++i) {
+            if(crossings_collector_ptr[i]) gsl_vector_free(crossings_collector_ptr[i]);
+        }
+        free(crossings_collector_ptr);
+    }
+    if(crossings_collector_capacities) free(crossings_collector_capacities);
+    if(K_all_raw) gsl_vector_free(K_all_raw);
+    if(r_all_raw) gsl_vector_free(r_all_raw);
+    if(phi_all_raw_temp) gsl_vector_free(phi_all_raw_temp);
+    if(phi_unwrapped_all) gsl_vector_free(phi_unwrapped_all);
+    if(spline_r_interp) gsl_spline_free(spline_r_interp);
+    if(spline_phi_interp) gsl_spline_free(spline_phi_interp);
+    if(acc_r_interp) gsl_interp_accel_free(acc_r_interp);
+    if(acc_phi_interp) gsl_interp_accel_free(acc_phi_interp);
+
+    // Propagate errors
+    if (full_traj_output && full_traj_output->error_code == 0 && core_error_code != 0) full_traj_output->error_code = core_error_code;
+    if (crossings_output && crossings_output->error_code == 0 && core_error_code != 0) crossings_output->error_code = core_error_code;
+    
+    // If an integration error happened (not alloc error), it's in integration_stop_code
+    if (full_traj_output && full_traj_output->error_code == 0 && (integration_stop_code >= 3 && integration_stop_code <= 5)) full_traj_output->error_code = -2; // General integration error
+    if (crossings_output && crossings_output->error_code == 0 && (integration_stop_code >= 3 && integration_stop_code <= 5)) crossings_output->error_code = -2;
+
+    if (core_error_code !=0) return core_error_code; // Prioritize allocation errors
+    return (integration_stop_code >= 3 && integration_stop_code <= 5) ? -1 : 0; // Return -1 for integration failures
+}
+
+
+// --- Public API Functions ---
+
+PhotonTrajectory* compute_trajectory(
+    double r_0, double phi_0, double M, double psi, double r_max,
+    double x_stop_val, bool x_stop_active,
+    const gsl_vector *x_targets,
+    double t_end, int num_interp_points
+) {
+    PhotonTrajectory *result = calloc(1, sizeof(PhotonTrajectory));
+    if (!result) { 
+        perror("compute_trajectory: calloc PhotonTrajectory failed"); 
+        return NULL; 
+    }
+    result->error_code = 0;
+    result->K = NULL; result->r = NULL; result->phi = NULL; 
+    result->x = NULL; result->y = NULL;
+    result->crossings_y_at_x_targets = NULL; 
+    result->num_x_targets = 0;
+
+    int n_interp = (num_interp_points > 0) ? num_interp_points : DEFAULT_NUM_INTERP_POINTS;
+    if (num_interp_points == 0) n_interp = 1; 
+
+    int core_status = integrate_photon_trajectory_core(
+        r_0, phi_0, M, psi, r_max, x_stop_val, x_stop_active, x_targets, t_end,
+        1e-10, 1e-10, result, NULL, n_interp);
+
+    if (core_status != 0 && result->error_code == 0) {
+        result->error_code = core_status; 
+    }
+    if (result->K == NULL && result->error_code == 0 && n_interp > 0) {
+        fprintf(stderr, "compute_trajectory: Warning - K is NULL post-integration despite no error_code set by core.\n");
+        result->error_code = -10; 
+    }
+    return result;
+}
+
+void free_photon_trajectory(PhotonTrajectory *traj) {
+    if (!traj) { return; }
+    if(traj->K) { gsl_vector_free(traj->K); traj->K = NULL; }
+    if(traj->r) { gsl_vector_free(traj->r); traj->r = NULL; }
+    if(traj->phi) { gsl_vector_free(traj->phi); traj->phi = NULL; }
+    if(traj->x) { gsl_vector_free(traj->x); traj->x = NULL; }
+    if(traj->y) { gsl_vector_free(traj->y); traj->y = NULL; }
+    if (traj->crossings_y_at_x_targets) {
+        for (size_t i = 0; i < traj->num_x_targets; ++i) {
+            if(traj->crossings_y_at_x_targets[i]) { 
+                gsl_vector_free(traj->crossings_y_at_x_targets[i]);
+            }
+        }
+        free(traj->crossings_y_at_x_targets);
+        traj->crossings_y_at_x_targets = NULL;
+    }
+    free(traj);
+}
+
+TrajectoryCrossings* compute_trajectory_crossings_only(
+    double r_0, double phi_0, double M, double psi, double r_max,
+    double x_stop_val, bool x_stop_active,
+    const gsl_vector *x_targets, double t_end
+) {
+    if (!x_targets) { 
+        fprintf(stderr, "compute_trajectory_crossings_only: x_targets cannot be NULL.\n");
+        return NULL;
+    }
+    TrajectoryCrossings *result = calloc(1, sizeof(TrajectoryCrossings));
+    if (!result) { 
+        perror("compute_trajectory_crossings_only: calloc TrajectoryCrossings failed"); 
+        return NULL; 
+    }
+    result->error_code = 0;
+    result->crossings_y_at_x_targets = NULL; 
+    result->num_x_targets = 0; 
+
+    int core_status = integrate_photon_trajectory_core(
+        r_0, phi_0, M, psi, r_max, x_stop_val, x_stop_active, x_targets, t_end,
+        1e-8, 1e-10, NULL, result, 0 ); 
+
+    if (core_status != 0 && result->error_code == 0) {
+        result->error_code = core_status;
+    }
+     if (result->crossings_y_at_x_targets == NULL && result->error_code == 0 && x_targets->size > 0) {
+        fprintf(stderr, "compute_trajectory_crossings_only: Warning - crossings_y_at_x_targets is NULL post-integration.\n");
+        result->error_code = -11; 
+    }
+    return result;
+}
+
+void free_trajectory_crossings(TrajectoryCrossings *crossings) {
+    if (!crossings) { return; }
+    if (crossings->crossings_y_at_x_targets) {
+        for (size_t i = 0; i < crossings->num_x_targets; ++i) {
+            if(crossings->crossings_y_at_x_targets[i]) { 
+                gsl_vector_free(crossings->crossings_y_at_x_targets[i]);
+            }
+        }
+        free(crossings->crossings_y_at_x_targets);
+        crossings->crossings_y_at_x_targets = NULL;
+    }
+    free(crossings);
+}
+
+
+#ifdef UNIT_TEST_TRAJECTORY_MODULE
+// Example unit tests for compute_trajectory and compute_trajectory_crossings_only
+// Ensure M_PI is available (from math.h, typically included via schwarzschild_tracer.h)
+int main() {
+    printf("--- Unit Test for Trajectory Module (compute_trajectory*, free_*) ---\n");
+    gsl_set_error_handler_off();
+
+    // Test 1: compute_trajectory - scattering
+    printf("Test 1: compute_trajectory (scattering)...\n");
+    PhotonTrajectory *traj1 = compute_trajectory(20.0, 0.0, 1.0, -1.25, 100.0, 
+                                                 gsl_nan(), false, // x_stop_val, x_stop_active
+                                                 NULL, // x_targets
+                                                 1000.0, 10); // t_end, num_interp_points
+    if (traj1 && traj1->error_code == 0 && traj1->K && traj1->K->size > 0 && traj1->r && traj1->r->size == traj1->K->size) {
+        printf("  Scatter test K size: %zu, final r: %g\n", traj1->K->size, gsl_vector_get(traj1->r, traj1->r->size-1));
+        if (gsl_vector_get(traj1->r, traj1->r->size-1) > 19.0) { 
+            printf("  Scatter test PASSED.\n");
+        } else {
+            printf("  Scatter test FAILED (final r %.2f too small).\n", gsl_vector_get(traj1->r, traj1->r->size-1));
+        }
+    } else {
+        printf("  Scatter test FAILED (error_code %d or NULL/mismatched K/r or K empty).\n", traj1 ? traj1->error_code : -999);
+    }
+    free_photon_trajectory(traj1);
+
+    // Test 2: compute_trajectory_crossings_only - inward radial
+    printf("Test 2: compute_trajectory_crossings_only (inward radial)...\n");
+    gsl_vector *xt_test2 = gsl_vector_alloc(2);
+    gsl_vector_set(xt_test2, 0, 4.0);
+    gsl_vector_set(xt_test2, 1, 3.0);
+    TrajectoryCrossings *cross2 = compute_trajectory_crossings_only(5.0, 0.0, 1.0, -M_PI/2, 100.0, 
+                                                                    0.0, true, // x_stop_val, x_stop_active
+                                                                    xt_test2, 1000.0); 
+    if (cross2 && cross2->error_code == 0 && cross2->num_x_targets == 2 && 
+        cross2->crossings_y_at_x_targets && 
+        cross2->crossings_y_at_x_targets[0] && cross2->crossings_y_at_x_targets[0]->size > 0 &&
+        cross2->crossings_y_at_x_targets[1] && cross2->crossings_y_at_x_targets[1]->size > 0) {
+        printf("  Crossings test: Target x=%.1f, y_cross=%.4f; Target x=%.1f, y_cross=%.4f\n",
+                gsl_vector_get(xt_test2, 0), gsl_vector_get(cross2->crossings_y_at_x_targets[0],0),
+                gsl_vector_get(xt_test2, 1), gsl_vector_get(cross2->crossings_y_at_x_targets[1],0));
+        if (fabs(gsl_vector_get(cross2->crossings_y_at_x_targets[0],0)) < 1e-6 &&
+            fabs(gsl_vector_get(cross2->crossings_y_at_x_targets[1],0)) < 1e-6) {
+             printf("  Crossings test PASSED (y ~ 0 for radial).\n");
+        } else {
+             printf("  Crossings test FAILED (y not close to 0).\n");
+        }
+    } else {
+        printf("  Crossings test FAILED (error_code %d or unexpected structure/counts).\n", cross2 ? cross2->error_code : -999);
+         if (cross2) {
+            printf("    Details: num_x_targets=%zu, crossings_ptr=%p\n", cross2->num_x_targets, (void*)cross2->crossings_y_at_x_targets);
+            if (cross2->crossings_y_at_x_targets && cross2->num_x_targets >0) {
+                 printf("      Target 0: ptr=%p, size=%zu\n", (void*)cross2->crossings_y_at_x_targets[0], cross2->crossings_y_at_x_targets[0] ? cross2->crossings_y_at_x_targets[0]->size : 0);
+                 if (cross2->num_x_targets >1) printf("      Target 1: ptr=%p, size=%zu\n", (void*)cross2->crossings_y_at_x_targets[1], cross2->crossings_y_at_x_targets[1] ? cross2->crossings_y_at_x_targets[1]->size : 0);
+            }
+        }
+    }
+    free_trajectory_crossings(cross2);
+    gsl_vector_free(xt_test2);
+
+    printf("--- Unit Test for Trajectory Module Finished ---\n");
+    return 0;
+}
+#endif // UNIT_TEST_TRAJECTORY_MODULE
+
+// trajectory_module.c
+// Bottom
+
+
+
+// Top
+// schwarzschild_tracer.h
+#ifndef SCHWARZSCHILD_TRACER_H
+#define SCHWARZSCHILD_TRACER_H
+
+// Standard C Headers (that are generally useful for this library)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <stdint.h>
+#include <stdbool.h> // For bool type
+#include <ctype.h>   // For isspace etc. (used in PPM loader, good to have here)
+#include <float.h>   // For DBL_MAX, DBL_EPSILON
+
+// GSL Headers
+#include <gsl/gsl_odeiv2.h>
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_matrix.h> // Kept if any public interface uses it, otherwise can be removed
+#include <gsl/gsl_spline.h>
+#include <gsl/gsl_roots.h>
+#include <gsl/gsl_errno.h>
+#include <gsl/gsl_sys.h>    // For gsl_isnan etc.
+
+// --- Constants ---
+#ifndef M_PI // Guard for M_PI, as math.h might define it with _USE_MATH_DEFINES on some systems
+#define M_PI 3.14159265358979323846
+#endif
+#define MAX_EVENT_TYPES_CORE 100       
+#define MAX_K_PER_GSL_SUPER_STEP 0.01
+#define DEFAULT_T_END 1e6
+#define DEFAULT_NUM_INTERP_POINTS 1000
+#define DEFAULT_CHUNK_SIZE_PHOTONS 1000000
+#define EPSILON_GENERAL 1e-9
+#define EVENT_DETECTION_TOLERANCE 1e-9
+#define MAX_FILENAME_LEN 4096
+#define INITIAL_RAW_POINTS_CAPACITY 256
+#define INITIAL_SEGMENTS_CAPACITY 10
+#define INITIAL_CROSSING_POINTS_CAPACITY 8
+#define INITIAL_SAVED_FILES_CAPACITY 10
+
+
+// --- Public Struct Definitions ---
+
+// For ODE solver in trajectory calculations
+typedef struct {
+    double M;
+    double b;
+    int *sign_dr_dk; // Pointer to a mutable sign
+} ODEParams;
+
+// For event functions in trajectory calculations
+typedef struct {
+    double M; // Can be different from ODEParams M if events are general
+    double b; // Can be different from ODEParams b
+    double r_max_event;
+    double x_stop_event;
+    double x_target_event;
+    ODEParams *ode_p_event; // Pointer to the ODEParams for context if needed
+} EventFunctionParams;
+
+// For full photon trajectory output
+typedef struct {
+    gsl_vector *x;
+    gsl_vector *y;
+    gsl_vector *r;
+    gsl_vector *phi;
+    gsl_vector *K; // Affine parameter
+    gsl_vector **crossings_y_at_x_targets; // Array of GSL vectors for y-crossings
+    size_t num_x_targets;
+    int error_code; // 0 for success, negative for errors
+} PhotonTrajectory;
+
+// For trajectory crossings only output
+typedef struct {
+    gsl_vector **crossings_y_at_x_targets;
+    size_t num_x_targets;
+    int error_code;
+} TrajectoryCrossings;
+
+// For image_map function results
+typedef struct {
+    int miss;        // 1 if miss, 0 if hit
+    double y_window; // y-coordinate on window plane
+    double y_image;  // y-coordinate on source/image plane
+    int error_code;
+} ImageMapResult;
+
+// Data point structure for photon mapping (saved to/loaded from chunks)
+typedef struct {
+    double y_window_cart_x;
+    double y_window_cart_y;
+    double y_image_cart_x;
+    double y_image_cart_y;
+} PhotonMapDataPoint;
+
+// For PPM images
+typedef struct {
+    unsigned char r, g, b;
+} RGBColor;
+
+typedef struct {
+    unsigned char *data;
+    int width;
+    int height;
+    int channels; // Should always be 3 for P6
+} PPMImage;
+
+// For results_radial_light_ring output
+typedef struct {
+    char** saved_files_list;         // List of chunk filenames created
+    gsl_vector* r_sample_misses;    // r_rho values that missed
+    gsl_vector* r_sample_hits;      // r_rho values that hit
+    int num_files_created;          // Actual count of file strings in saved_files_list
+    int capacity_saved_files;       // Current capacity of saved_files_list array
+} ResultsRadialLightRingOutput;
+
+
+// --- Public Function Declarations ---
+
+// From trajectory_module.c (or trajectory_api.c in earlier plans)
+
+double normalize_phi(double phi);
+int gsl_vector_dynamic_append(gsl_vector **vec_ptr, double value_param, size_t *current_capacity_ptr);
+
+PhotonTrajectory* compute_trajectory(
+    double r_0, double phi_0, double M, double psi, double r_max,
+    double x_stop_val, bool x_stop_active,
+    const gsl_vector *x_targets,
+    double t_end, int num_interp_points
+);
+void free_photon_trajectory(PhotonTrajectory *traj);
+
+TrajectoryCrossings* compute_trajectory_crossings_only(
+    double r_0, double phi_0, double M, double psi, double r_max,
+    double x_stop_val, bool x_stop_active,
+    const gsl_vector *x_targets, double t_end
+);
+void free_trajectory_crossings(TrajectoryCrossings *crossings);
+
+// From image_mapping_utils.c
+ImageMapResult image_map(
+    double Y, double Z, double x_0_plane, double x_1_window, double x_2_observer, double a_scale
+);
+ImageMapResult image_map_radial(
+    double r_rho, double x_0_plane, double x_1_window, double x_2_observer, double a_scale_factor
+);
+
+// From results_generation.c
+char** results_cartesian(
+    double x_0, double x_1, double x_2, double a_param, int n_param,
+    size_t chunk_size_photons, int* out_num_files_created
+);
+char** results_radial(
+    double x_0, double x_1, double x_2, double R_max_sample, int n_param,
+    size_t chunk_size_photons, int* out_num_files_created
+);
+ResultsRadialLightRingOutput* results_radial_light_ring(
+    double x_0, double x_1, double x_2, int n_param,
+    size_t chunk_size_photons
+);
+void free_results_radial_light_ring_output(ResultsRadialLightRingOutput* output);
+void free_string_array(char** arr, int count); // General utility
+
+// From photon_rendering.c
+int map_photons(
+    const char *image_source_path,
+    PPMImage *image_source_data, // Parameter name can be simpler in .h
+    char **photon_chunk_files,
+    int num_chunk_files,         // Parameter name can be simpler in .h
+    const char *save_path,
+    double source_logical_width_input,
+    int target_output_pixel_width,
+    const double *observer_window_bounds,
+    RGBColor default_color            // Parameter name can be simpler in .h
+);
+
+// From photon_chunk_io.c
+int save_photon_data_chunk(const char *filename, const PhotonMapDataPoint* data, size_t num_points);
+PhotonMapDataPoint* load_photon_data_chunk(const char *filename, size_t *num_points_read);
+
+// From ppm_image_io.c
+PPMImage* load_ppm_image(const char *filename);
+int save_ppm_image(const char *filename, const PPMImage *image);
+void free_ppm_image(PPMImage *image);
+
+#endif // SCHWARZSCHILD_TRACER_H
+// End of schwarzschild_tracer.h
+// Bottom
